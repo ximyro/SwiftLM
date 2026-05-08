@@ -3097,6 +3097,11 @@ public final class OmniModelFactory: ModelFactory, @unchecked Sendable {
         )
     }
 
+    @available(*, deprecated, message: "Use extractMultimodalTokens(configuration:).numAudio instead")
+    public static func extractNumAudioEmbeddings(configuration: ResolvedModelConfiguration) -> Int {
+        extractMultimodalTokens(configuration: configuration).numAudio
+    }
+
     public static func extractMultimodalTokens(configuration: ResolvedModelConfiguration) -> (numAudio: Int, boa: Int, eoa: Int) {
         let configurationURL = configuration.modelDirectory.appending(component: "config.json")
         var numAudio = 128
