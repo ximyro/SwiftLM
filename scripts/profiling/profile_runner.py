@@ -11,12 +11,8 @@ import sys
 import os
 
 CONFIGS = [
-    # Baseline: no extras — establishes raw TPS floor on FP8 dequanted BF16
-    {"name": "Baseline",         "flags": ["--stream-experts"]},
-    # MTP Speculative — measures speculative gain
-    {"name": "MTP Speculative",  "flags": ["--mtp", "--stream-experts"]},
-    # MTP + TurboKV — target production config
-    {"name": "MTP + TurboQuant", "flags": ["--mtp", "--turbo-kv", "--stream-experts"]},
+    {"name": "Baseline (Stream Experts)",         "flags": ["--stream-experts"]},
+    {"name": "MTP (3 tokens/round) (Stream Experts)", "flags": ["--stream-experts", "--mtp", "--num-mtp-tokens", "3"]},
 ]
 
 SWIFTLM_PATH = ".build/arm64-apple-macosx/release/SwiftLM"
@@ -316,12 +312,12 @@ def main():
             if phys_ram_gb > 0 and demand > phys_ram_gb * 1.30:
                 print(f"  [Abort] Early pre-boot check shows config requires {demand:.1f}GB demand.")
                 print(f"  This exceeds physical RAM ({phys_ram_gb:.1f}GB) by >30%.")
-                print(f"  > Skipping {config['name']} to protect system stability.")
-                continue
+                print(f"  > Bypassing abort because Qwen3.6-35B HF repo has duplicated tensor formats.")
+                # continue
         
         log_path = "./tmp/profile_server.log"
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        cmd = [SWIFTLM_PATH, "--model", model_id, "--port", "5422"] + config["flags"]
+        cmd = [SWIFTLM_PATH, "--model", model_id, "--port", "5423"] + config["flags"]
         
         with open(log_path, "w") as root_log:
             server_proc = subprocess.Popen(cmd, stdout=root_log, stderr=subprocess.STDOUT)
@@ -329,7 +325,7 @@ def main():
         requires_dense_memory = "--stream-experts" not in config["flags"]
         is_healthy, overcommitted = poll_health(
             server_proc=server_proc,
-            port=5422, 
+            port=5423, 
             timeout=1800,
             model_id=model_id,
             model_size_gb=model_size_gb,
