@@ -110,8 +110,9 @@ else
     echo "10) Test 10: SSD + Draft Model Memory Regression (Issue #72 — auto-cap + RAM guard)"
     echo "11) Test 11: DFlash Benchmark (Qwen3-Coder-Next-4bit)"
     echo "12) Test 12: DFlash Benchmark (Qwen3.6-35B-A3B-4bit)"
+    echo "13) Test 13: Gemma-4 MTP Speculative Decoding Benchmark"
     echo "q) Quit"
-    read -p "Option (0-12/q): " suite_opt
+    read -p "Option (0-13/q): " suite_opt
 fi
 
 if [ "$suite_opt" == "0" ]; then
@@ -218,6 +219,44 @@ if [ "$suite_opt" == "12" ]; then
     chmod +x scripts/profiling/bench_35b.sh
     scripts/profiling/bench_35b.sh
     exit $?
+fi
+
+if [ "$suite_opt" == "13" ]; then
+    echo ""
+    echo "=> Starting Test 13: Gemma-4 MTP Speculative Decoding Benchmark"
+    echo "Building benchmark binary..."
+    swift build -c release --product Gemma4MTPBench
+    
+    echo ""
+    echo "--- Test 13A: Small Context (max-kv-size=512) on E2B Model ---"
+    swift run -c release Gemma4MTPBench \
+      --main-model mlx-community/gemma-4-e2b-it-4bit \
+      --asst-model mlx-community/gemma-4-E2B-it-assistant-bf16 \
+      --prompt "What is the capital of France? Please tell me the history of it in 3 sentences." \
+      --max-tokens 100 \
+      --max-kv-size 512 | grep -v "ASST DEBUG"
+      
+    echo ""
+    echo "--- Test 13B: Medium Context (max-kv-size=4096) on E2B Model ---"
+    swift run -c release Gemma4MTPBench \
+      --main-model mlx-community/gemma-4-e2b-it-4bit \
+      --asst-model mlx-community/gemma-4-E2B-it-assistant-bf16 \
+      --prompt "Write a detailed 3-paragraph essay on the impact of the Industrial Revolution on modern supply chain logistics. Ensure you include dates and specific technological advancements." \
+      --max-tokens 100 \
+      --max-kv-size 4096 | grep -v "ASST DEBUG"
+      
+    echo ""
+    echo "--- Test 13C: Large Context (max-kv-size=8192) on E2B Model ---"
+    swift run -c release Gemma4MTPBench \
+      --main-model mlx-community/gemma-4-e2b-it-4bit \
+      --asst-model mlx-community/gemma-4-E2B-it-assistant-bf16 \
+      --prompt "Explain quantum computing as if I were a 10 year old. Then, explain it to a physics graduate student." \
+      --max-tokens 100 \
+      --max-kv-size 8192 | grep -v "ASST DEBUG"
+      
+    echo ""
+    echo "✅ Gemma-4 MTP Speculative Decoding Benchmarks Complete."
+    exit 0
 fi
 
 echo ""
