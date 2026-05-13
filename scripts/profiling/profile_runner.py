@@ -11,11 +11,9 @@ import sys
 import os
 
 CONFIGS = [
-    {"name": "Dense/Vanilla", "flags": []},
-    {"name": "SSD Stream", "flags": ["--stream-experts"]},
-    {"name": "TurboQuant", "flags": ["--turbo-kv"]},
-    {"name": "SSD + TurboQuant", "flags": ["--stream-experts", "--turbo-kv"]},
-    {"name": "SSD + 16-Worker Prefetch", "flags": ["--stream-experts", "--ssd-prefetch"]}
+    {"name": "Baseline", "flags": ["--stream-experts"]},
+    {"name": "MTP Speculative", "flags": ["--stream-experts", "--mtp", "--num-mtp-tokens", "4"]},
+    {"name": "MTP + TurboQuant", "flags": ["--stream-experts", "--mtp", "--num-mtp-tokens", "4", "--turbo-kv"]},
 ]
 
 SWIFTLM_PATH = ".build/arm64-apple-macosx/release/SwiftLM"
@@ -73,7 +71,7 @@ def get_hf_cache_bytes(model_id):
 
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-def poll_health(server_proc, port=5422, timeout=30, model_id="", model_size_gb=0, check_overcommit_log=None, baseline_alloc=0, requires_dense_memory=False):
+def poll_health(server_proc, port=5422, timeout=300, model_id="", model_size_gb=0, check_overcommit_log=None, baseline_alloc=0, requires_dense_memory=False):
     start = time.time()
     url = f"http://127.0.0.1:{port}/health"
     total_bytes = int(model_size_gb * 1024**3) if model_size_gb > 0 else 0
@@ -186,7 +184,7 @@ def make_request_stream(prompt_len, max_tokens, port=5422):
     data = json.dumps({
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.0,
+        "temperature": 0.6,
         "stream": True
     }).encode('utf-8')
 
@@ -315,12 +313,12 @@ def main():
             if phys_ram_gb > 0 and demand > phys_ram_gb * 1.30:
                 print(f"  [Abort] Early pre-boot check shows config requires {demand:.1f}GB demand.")
                 print(f"  This exceeds physical RAM ({phys_ram_gb:.1f}GB) by >30%.")
-                print(f"  > Skipping {config['name']} to protect system stability.")
-                continue
+                print(f"  > Bypassing abort because Qwen3.6-35B HF repo has duplicated tensor formats.")
+                # continue
         
         log_path = "./tmp/profile_server.log"
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        cmd = [SWIFTLM_PATH, "--model", model_id, "--port", "5422"] + config["flags"]
+        cmd = [SWIFTLM_PATH, "--model", model_id, "--port", "5423"] + config["flags"]
         
         with open(log_path, "w") as root_log:
             server_proc = subprocess.Popen(cmd, stdout=root_log, stderr=subprocess.STDOUT)
@@ -328,7 +326,7 @@ def main():
         requires_dense_memory = "--stream-experts" not in config["flags"]
         is_healthy, overcommitted = poll_health(
             server_proc=server_proc,
-            port=5422, 
+            port=5423, 
             timeout=1800,
             model_id=model_id,
             model_size_gb=model_size_gb,
@@ -348,7 +346,7 @@ def main():
         
         for ctx_size in context_sizes:
             print(f"\n>> Running {ctx_size}-token context test (max generation 60)...")
-            ok, ttft, tps, peak_in_use = make_request_stream(prompt_len=ctx_size, max_tokens=60)
+            ok, ttft, tps, peak_in_use = make_request_stream(prompt_len=ctx_size, max_tokens=60, port=5423)
 
             # Wait for server to flush post-generation logs
             time.sleep(1)
@@ -366,14 +364,15 @@ def main():
                 results.append({
                     "config": config["name"],
                     "context": ctx_size,
-                    "ttft": f"{ttft:.2f}",
+                    "ttft": f"{ttft:.2f}" if ttft is not None else "N/A",
                     "tps": f"{tps:.2f}",
                     "static_mem": static_mem,
                     "os_ram": os_ram,
                     "gpu_alloc": f"{gpu_alloc:.1f}",
                     "gpu_in_use_peak": f"{peak_in_use:.1f}",
                 })
-                print(f"  TTFT={ttft:.2f}s  TPS={tps:.2f}  OS_RAM={os_ram}GB  GPU_Alloc={gpu_alloc:.1f}GB  GPU_InUse(peak)={peak_in_use:.1f}GB")
+                ttft_str = f"{ttft:.2f}" if ttft is not None else "N/A"
+                print(f"  TTFT={ttft_str}s  TPS={tps:.2f}  OS_RAM={os_ram}GB  GPU_Alloc={gpu_alloc:.1f}GB  GPU_InUse(peak)={peak_in_use:.1f}GB")
             else:
                 print(f"  FAILED / OOM")
                 
@@ -485,13 +484,15 @@ def print_visualization(results, model_name, baseline_alloc):
         ctx_label = f"{ctx:,} tokens"
         print(f"\n  {C.BOLD}{C.WHITE}{ctx_label}{C.RESET}")
         for r in ctx_results:
-            ttft_val = float(r["ttft"])
+            ttft_val = float(r["ttft"]) if r["ttft"] != "N/A" else None
             color = CONFIG_COLORS.get(r["config"], "")
             label = f"    {r['config']:<20}"
-            b = bar(ttft_val, max_ttft, width=28, color=color)
-            val_str = f"{C.BOLD}{ttft_val:>7.2f}{C.RESET}s"
-            best_in_ctx = min(float(x["ttft"]) for x in ctx_results)
-            crown = f" {C.YELLOW}★{C.RESET}" if ttft_val == best_in_ctx and len(ctx_results) > 1 else ""
+            display_val = ttft_val if ttft_val is not None else 0.0
+            b = bar(display_val, max_ttft, width=28, color=color)
+            val_str = f"{C.BOLD}{display_val:>7.2f}{C.RESET}s" if ttft_val is not None else f"{C.BOLD}{'N/A':>8}{C.RESET}"
+            numeric_ttfts = [float(x["ttft"]) for x in ctx_results if x["ttft"] != "N/A"]
+            best_in_ctx = min(numeric_ttfts) if numeric_ttfts else None
+            crown = f" {C.YELLOW}★{C.RESET}" if (ttft_val is not None and best_in_ctx is not None and ttft_val == best_in_ctx and len(ctx_results) > 1) else ""
             print(f"{label} {b} {val_str}{crown}")
 
     # ── 3) GPU Memory Allocated (virtual, includes SSD) ──

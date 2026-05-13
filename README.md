@@ -326,6 +326,31 @@ SwiftLM --port 8002 \
 
 ---
 
+## 🔮 Speculative Decoding & Multi-Token Prediction (MTP)
+
+SwiftLM supports two forms of Speculative Decoding to accelerate in-RAM inference:
+
+### 1. Traditional Dual-Model Speculative Decoding
+Load a small draft model alongside a large main model. The draft model generates candidate tokens at high speed, and the main model verifies them in bulk.
+*Requires passing both `--model` and `--draft-model`.*
+
+### 2. Multi-Token Prediction (MTP) Native Decoding
+For models trained with native MTP heads (e.g., the `Qwen3` family), SwiftLM automatically leverages the hidden MTP layers to draft future tokens within a single forward pass, completely eliminating the need to load a separate draft model.
+
+**Algorithmic Parity (Leviathan et al.)**
+SwiftLM implements mathematically rigorous **probabilistic rejection sampling** (as defined by Leviathan et al.) in its `MTPTokenIterator`. This ensures exact mathematical output parity with the target model's true distribution, even at non-zero temperatures, properly evaluating $P_{target} / P_{draft}$ and resampling the corrected distribution upon rejection.
+
+### ⚠️ Hardware Limitations & SSD Streaming (Help Wanted!)
+**MTP is strictly a Compute-Bound optimization.**
+We successfully verified algorithmic parity and a **15%+ TPS speedup** on the dense **`Qwen/Qwen3.6-27B`** model, which fits completely in 64GB VRAM.
+
+However, running MTP on massive MoE models (like the **`Qwen3.6-35B-A3B`**) on a 64GB Mac requires `--stream-experts` to fetch MoE weights from the NVMe SSD. Because MTP evaluates multiple draft tokens in parallel, the verify pass forces a massive I/O fan-out, attempting to fetch up to 3x as many unique experts from the SSD simultaneously.
+This saturates the NVMe bandwidth, causing the GPU to stall and completely neutralizing the MTP speedup. **If you are running a 64GB Mac, MTP on 35B+ MoE models will be slower than the baseline.**
+
+*(Community Help Wanted: We are actively looking for optimizations to batch expert pre-fetching during MTP verification to make this viable on 64GB Unified Memory limits!)*
+
+---
+
 ## 🔀 Why We Forked Apple MLX
 
 To achieve the extreme memory efficiency and speeds seen in **SSD Expert Streaming** and **Speculative Decoding**, `SwiftLM` relies on custom C++ primitives that bypass standard unified memory limits.

@@ -110,8 +110,9 @@ else
     echo "10) Test 10: SSD + Draft Model Memory Regression (Issue #72 — auto-cap + RAM guard)"
     echo "11) Test 11: DFlash Benchmark (Qwen3-Coder-Next-4bit)"
     echo "12) Test 12: DFlash Benchmark (Qwen3.6-35B-A3B-4bit)"
+    echo "13) Test 13: Gemma-4 MTP Speculative Decoding Benchmark"
     echo "q) Quit"
-    read -p "Option (0-12/q): " suite_opt
+    read -p "Option (0-13/q): " suite_opt
 fi
 
 if [ "$suite_opt" == "0" ]; then
@@ -220,6 +221,8 @@ if [ "$suite_opt" == "12" ]; then
     exit $?
 fi
 
+
+
 echo ""
 PS3="Select a model to use: "
 if [ "$suite_opt" == "4" ]; then
@@ -251,16 +254,11 @@ elif [ "$suite_opt" == "5" ] || [ "$suite_opt" == "6" ]; then
 else
     options=(
         "mlx-community/gemma-4-26b-a4b-it-8bit"
+        "mlx-community/gemma-4-26b-a4b-it-4bit"
         "mlx-community/gemma-4-31b-it-8bit"
+        "mlx-community/gemma-4-31b-it-4bit"
         "mlx-community/gemma-4-e4b-it-8bit"
-        "mlx-community/gemma-4-26b-a4b-it-4bit"
-        "mlx-community/gemma-4-26b-a4b-it-4bit"
-        "mlx-community/Qwen2.5-7B-Instruct-4bit"
-        "mlx-community/Qwen2.5-14B-Instruct-4bit"
-        "mlx-community/phi-4-mlx-4bit"
-        "baa-ai/GLM-5.1-RAM-270GB-MLX"
-        "baa-ai/GLM-5.1-4bit"
-        "Thump604/DeepSeek-V4-Flash-MLX-Q3-mixed-gs128-affine"
+        "mlx-community/gemma-4-e4b-it-4bit"
         "Custom (Enter your own Hub ID)"
         "Quit"
     )
@@ -1338,6 +1336,45 @@ if [ "$suite_opt" == "10" ]; then
         echo "   Log: $T10_LOG"
         exit 1
     fi
+fi
+
+if [ "$suite_opt" == "13" ]; then
+    echo ""
+    echo "=> Starting Test 13: Gemma-4 MTP Speculative Decoding Benchmark"
+    
+    # Infer assistant model
+    if [[ "$FULL_MODEL" == *"gemma-4-26b"* ]]; then
+        ASST_MODEL="mlx-community/gemma-4-26B-A4B-it-assistant-bf16"
+    elif [[ "$FULL_MODEL" == *"gemma-4-e2b"* ]]; then
+        ASST_MODEL="mlx-community/gemma-4-E2B-it-assistant-bf16"
+    else
+        read -p "Enter assistant model Hub ID: " ASST_MODEL
+    fi
+
+    echo ""
+    read -p "Enter context lengths to test [default: 512,40000,100000]: " CONTEXTS
+    CONTEXTS=${CONTEXTS:-"512,40000,100000"}
+
+    echo ""
+    echo "Building benchmark binary..."
+    swift build -c release --product Gemma4MTPBench
+
+    IFS=',' read -ra ADDR <<< "$CONTEXTS"
+    for ctx in "${ADDR[@]}"; do
+        ctx=$(echo "$ctx" | tr -d ' ')
+        echo ""
+        echo "--- Test 13: Context (max-kv-size=$ctx) on $FULL_MODEL ---"
+        swift run -c release Gemma4MTPBench \
+          --main-model "$FULL_MODEL" \
+          --asst-model "$ASST_MODEL" \
+          --prompt "Write a detailed 3-paragraph essay on the impact of the Industrial Revolution on modern supply chain logistics. Ensure you include dates and specific technological advancements." \
+          --max-tokens 100 \
+          --max-kv-size "$ctx" | grep -v "ASST DEBUG"
+    done
+    
+    echo ""
+    echo "✅ Gemma-4 MTP Speculative Decoding Benchmarks Complete."
+    exit 0
 fi
 
 # Fallback to Test 1 for anything else
