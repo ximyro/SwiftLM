@@ -1426,17 +1426,8 @@ func handleChatCompletion(
         systemPromptText = "JSON_MODE:" + systemPromptText
     }
 
-    // Convert OpenAI tools format → [String: any Sendable] for UserInput
-    let toolSpecs: [[String: any Sendable]]? = chatReq.tools?.map { tool in
-        var spec: [String: any Sendable] = ["type": tool.type]
-        var fn: [String: any Sendable] = ["name": tool.function.name]
-        if let desc = tool.function.description { fn["description"] = desc }
-        if let params = tool.function.parameters {
-            fn["parameters"] = params.mapValues { $0.value }
-        }
-        spec["function"] = fn
-        return spec
-    }
+    let toolCallFormat = await container.configuration.toolCallFormat
+    let toolSpecs = makeTemplateToolSpecs(chatReq.tools, toolCallFormat: toolCallFormat)
 
     // ── Acquire slot (concurrency limiter) ──
     await semaphore.wait()
@@ -1475,7 +1466,7 @@ func handleChatCompletion(
     if chatReq.enableThinking == nil,
        chatReq.chatTemplateKwargs?["enable_thinking"] == nil,
        toolSpecs?.isEmpty == false,
-       await container.configuration.toolCallFormat == .gemma4
+       toolCallFormat == .gemma4
     {
         enableThinking = true
     }
@@ -1546,6 +1537,7 @@ func handleChatCompletion(
                 includeUsage: includeUsage, promptTokenCount: promptTokenCount,
                 enableThinking: enableThinking, jsonMode: jsonMode, semaphore: semaphore,
                 stats: stats, genStart: genStart, prefillStart: prefillStart,
+                tools: chatReq.tools,
                 emitPrefillProgress: false, onPrefillDone: nil
             )
         } else {
@@ -1553,7 +1545,8 @@ func handleChatCompletion(
                 stream: genStream, modelId: modelId, stopSequences: stopSequences,
                 promptTokenCount: promptTokenCount, enableThinking: enableThinking,
                 jsonMode: jsonMode, semaphore: semaphore,
-                stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: nil
+                stats: stats, genStart: genStart, prefillStart: prefillStart,
+                tools: chatReq.tools, onPrefillDone: nil
             )
         }
     }
@@ -1672,6 +1665,7 @@ func handleChatCompletion(
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
             enableThinking: enableThinking, jsonMode: jsonMode, semaphore: semaphore,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
+            tools: chatReq.tools,
             emitPrefillProgress: emitPrefillProgress, onPrefillDone: onPrefillDone
         )
     } else {
@@ -1679,7 +1673,8 @@ func handleChatCompletion(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
             jsonMode: jsonMode, semaphore: semaphore,
-            stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: onPrefillDone
+            stats: stats, genStart: genStart, prefillStart: prefillStart,
+            tools: chatReq.tools, onPrefillDone: onPrefillDone
         )
     }
 }
@@ -1691,8 +1686,8 @@ func handleChatCompletion(
 /// Matches llama-server's behaviour: thinking tokens → delta.reasoning_content,
 /// response tokens → delta.content (content is nil while thinking).
 struct ThinkingStateTracker {
-    enum Phase { case thinking, responding }
-    private(set) var phase: Phase = .responding
+    enum Phase { case preThinking, thinking, responding }
+    private(set) var phase: Phase = .preThinking
     private var buffer = ""  // accumulates chars looking for tag boundaries
 
     /// Feed the next text fragment. Returns (reasoningContent, responseContent)
@@ -1704,6 +1699,31 @@ struct ThinkingStateTracker {
 
         while !buffer.isEmpty {
             switch phase {
+            case .preThinking:
+                let startRange = buffer.range(of: "<thinking>") ?? buffer.range(of: "<think>") ?? buffer.range(of: "<|channel>thought\n") ?? buffer.range(of: "<|channel>thought")
+                let endRange = buffer.range(of: "</thinking>") ?? buffer.range(of: "</think>") ?? buffer.range(of: "<channel|>")
+
+                if let endRange,
+                   startRange == nil || endRange.lowerBound < startRange!.lowerBound
+                {
+                    // Implicit reasoning mode: the prompt supplied the opening tag,
+                    // so the model only emits reasoning followed by the closing tag.
+                    reasoning += String(buffer[buffer.startIndex..<endRange.lowerBound])
+                    buffer.removeSubrange(buffer.startIndex..<endRange.upperBound)
+                    phase = .responding
+                } else if let range = startRange {
+                    content += String(buffer[buffer.startIndex..<range.lowerBound])
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .thinking
+                } else if isSuffixOfTag(buffer, tags: ["<think>", "<thinking>", "<|channel>thought\n", "<|channel>thought", "</think>", "</thinking>", "<channel|>"]) {
+                    return (reasoning, content)
+                } else {
+                    // Until the first completed thinking delimiter, treat text as
+                    // reasoning. This preserves Qwen's implicit `...</think>` mode
+                    // when the opening tag was injected into the prompt.
+                    reasoning += buffer
+                    buffer = ""
+                }
             case .responding:
                 let startRange = buffer.range(of: "<thinking>") ?? buffer.range(of: "<think>") ?? buffer.range(of: "<|channel>thought\n") ?? buffer.range(of: "<|channel>thought")
                 if let range = startRange {
@@ -1772,6 +1792,7 @@ func handleChatStreaming(
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
+    tools: [ChatCompletionRequest.ToolDef]?,
     emitPrefillProgress: Bool,
     onPrefillDone: (() async -> Void)? = nil
 ) -> Response {
@@ -1929,8 +1950,13 @@ func handleChatStreaming(
                 }
 
             case .toolCall(let tc):
+                let preparedArgs = prepareToolCallArgumentsForEmission(
+                    name: tc.function.name, arguments: tc.function.arguments, tools: tools)
+                if let missingArgs = preparedArgs.missingRequired {
+                    print("srv warning: emitting malformed tool_call '\(tc.function.name)' with missing required arguments: \(missingArgs.joined(separator: ","))")
+                }
                 hasToolCalls = true
-                let argsJson = serializeToolCallArgs(tc.function.arguments)
+                let argsJson = serializeToolCallArgs(preparedArgs.arguments)
                 cont.yield(sseToolCallChunk(modelId: modelId, index: toolCallIndex, name: tc.function.name, arguments: argsJson))
                 toolCallIndex += 1
 
@@ -2008,6 +2034,7 @@ func handleChatNonStreaming(
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
+    tools: [ChatCompletionRequest.ToolDef]?,
     onPrefillDone: (() async -> Void)? = nil
 ) async throws -> Response {
     var fullText = ""
@@ -2038,7 +2065,12 @@ func handleChatNonStreaming(
             print(text, terminator: "")
             fflush(stdout)
         case .toolCall(let tc):
-            let argsJson = serializeToolCallArgs(tc.function.arguments)
+            let preparedArgs = prepareToolCallArgumentsForEmission(
+                name: tc.function.name, arguments: tc.function.arguments, tools: tools)
+            if let missingArgs = preparedArgs.missingRequired {
+                print("srv warning: emitting malformed tool_call '\(tc.function.name)' with missing required arguments: \(missingArgs.joined(separator: ","))")
+            }
+            let argsJson = serializeToolCallArgs(preparedArgs.arguments)
             collectedToolCalls.append(ToolCallResponse(
                 id: "call_\(UUID().uuidString.prefix(8))",
                 type: "function",
@@ -2137,14 +2169,21 @@ func extractThinkingBlock(from text: String) -> (String?, String) {
     let startTag = text.range(of: "<thinking>") ?? text.range(of: "<think>") ?? text.range(of: "<|channel>thought\n") ?? text.range(of: "<|channel>thought") ?? (text.hasPrefix("thought\n") ? text.range(of: "thought\n") : nil)
     let endTag = text.range(of: "</thinking>") ?? text.range(of: "</think>") ?? text.range(of: "<channel|>")
     
-    guard let startRange = startTag, let endRange = endTag else {
-        // If there's an unclosed thinking block (still thinking when stopped)
-        if let startRange = startTag {
-            let thinking = String(text[startRange.upperBound...])
-            return (thinking.isEmpty ? nil : thinking, "")
+    guard let startRange = startTag else {
+        if let endRange = endTag {
+            let thinking = String(text[..<endRange.lowerBound])
+            let remaining = String(text[endRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (thinking.isEmpty ? nil : thinking, remaining)
         }
         return (nil, text)
     }
+
+    guard let endRange = endTag else {
+        let thinking = String(text[startRange.upperBound...])
+        return (thinking.isEmpty ? nil : thinking, "")
+    }
+
     let thinking = String(text[startRange.upperBound..<endRange.lowerBound])
     let remaining = String(text[endRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
     return (thinking.isEmpty ? nil : thinking, remaining)
@@ -2662,6 +2701,83 @@ func serializeToolCallArgs(_ args: [String: JSONValue]) -> String {
     return String(data: data, encoding: .utf8) ?? "{}"
 }
 
+func normalizeToolCallArguments(
+    name: String,
+    arguments: [String: JSONValue],
+    tools: [ChatCompletionRequest.ToolDef]?
+) -> [String: JSONValue] {
+    var normalized = arguments
+
+    guard requiredToolArguments(name: name, tools: tools).contains("filePath"),
+          isMissingToolCallArgument(normalized["filePath"])
+    else {
+        return normalized
+    }
+
+    let aliases = ["path", "file_path", "filepath", "file"]
+    let candidates = aliases.compactMap { alias -> JSONValue? in
+        guard let value = normalized[alias],
+              !isMissingToolCallArgument(value)
+        else {
+            return nil
+        }
+        return value
+    }
+
+    if candidates.count == 1 {
+        normalized["filePath"] = candidates[0]
+    }
+
+    return normalized
+}
+
+func prepareToolCallArgumentsForEmission(
+    name: String,
+    arguments: [String: JSONValue],
+    tools: [ChatCompletionRequest.ToolDef]?
+) -> (arguments: [String: JSONValue], missingRequired: [String]?) {
+    let normalized = normalizeToolCallArguments(name: name, arguments: arguments, tools: tools)
+    return (
+        normalized,
+        missingRequiredToolCallArguments(name: name, arguments: normalized, tools: tools)
+    )
+}
+
+func missingRequiredToolCallArguments(
+    name: String,
+    arguments: [String: JSONValue],
+    tools: [ChatCompletionRequest.ToolDef]?
+) -> [String]? {
+    let missing = requiredToolArguments(name: name, tools: tools).filter { key in
+        isMissingToolCallArgument(arguments[key])
+    }
+    return missing.isEmpty ? nil : missing
+}
+
+private func isMissingToolCallArgument(_ value: JSONValue?) -> Bool {
+    guard let value else { return true }
+    if case .null = value { return true }
+    return false
+}
+
+private func requiredToolArguments(
+    name: String,
+    tools: [ChatCompletionRequest.ToolDef]?
+) -> [String] {
+    guard let tools else { return [] }
+    guard let tool = tools.first(where: { $0.type == "function" && $0.function.name == name }),
+          let rawRequired = tool.function.parameters?["required"]?.value
+    else { return [] }
+
+    if let required = rawRequired as? [String] {
+        return required
+    }
+    if let required = rawRequired as? [Any] {
+        return required.compactMap { $0 as? String }
+    }
+    return []
+}
+
 // ── OpenAI-compatible types ───────────────────────────────────────────────────
 
 struct StreamOptions: Decodable {
@@ -2835,6 +2951,188 @@ struct ChatCompletionRequest: Decodable {
         case chatTemplateKwargs = "chat_template_kwargs"
         case enableThinking = "enable_thinking"
         case kvBits = "kv_bits"
+    }
+}
+
+func makeTemplateToolSpecs(
+    _ tools: [ChatCompletionRequest.ToolDef]?,
+    toolCallFormat: ToolCallFormat?
+) -> [[String: any Sendable]]? {
+    guard let tools, !tools.isEmpty else { return nil }
+
+    let specs: [[String: any Sendable]] = tools.compactMap { tool in
+        guard tool.type == "function" else { return nil }
+
+        var function: [String: any Sendable] = ["name": tool.function.name]
+        function["description"] = tool.function.description ?? ""
+
+        if let parameters = tool.function.parameters {
+            let rawParameters = parameters.mapValues { $0.value }
+            let templateParameters =
+                toolCallFormat == .gemma4
+                ? normalizeGemma4ToolSchema(rawParameters)
+                : rawParameters
+            function["parameters"] = sendableJSONValue(templateParameters)
+        } else if toolCallFormat == .gemma4 {
+            function["parameters"] = sendableJSONValue(defaultGemma4ObjectSchema())
+        }
+
+        return [
+            "type": tool.type,
+            "function": function,
+        ]
+    }
+
+    return specs.isEmpty ? nil : specs
+}
+
+private func defaultGemma4ObjectSchema() -> [String: Any] {
+    [
+        "type": "object",
+        "properties": [String: Any](),
+        "required": [Any](),
+    ]
+}
+
+private func normalizeGemma4ToolSchema(_ value: Any) -> Any {
+    if let dict = value as? [String: Any] {
+        return normalizeGemma4SchemaObject(dict)
+    }
+
+    if let array = value as? [Any] {
+        return array.map(normalizeGemma4ToolSchema)
+    }
+
+    return value
+}
+
+private func normalizeGemma4SchemaObject(_ schema: [String: Any]) -> [String: Any] {
+    var result = flattenGemma4Composition(in: schema)
+
+    if let typeArray = result["type"] as? [Any] {
+        let types = typeArray.compactMap { $0 as? String }
+        if types.contains("null") {
+            result["nullable"] = true
+        }
+        result["type"] = types.first { $0 != "null" } ?? "string"
+    } else if !(result["type"] is String) {
+        result["type"] = inferGemma4SchemaType(result)
+    }
+
+    let type = ((result["type"] as? String) ?? "string").lowercased()
+    result["type"] = type
+
+    if type == "object" {
+        let rawProperties = result["properties"] as? [String: Any] ?? [:]
+        result["properties"] = normalizeGemma4Properties(rawProperties)
+        if !(result["required"] is [Any]) && !(result["required"] is [String]) {
+            result["required"] = [Any]()
+        }
+    } else if type == "array" {
+        if let items = result["items"] as? [String: Any] {
+            result["items"] = normalizeGemma4SchemaObject(items)
+        } else {
+            result["items"] = ["type": "string"]
+        }
+    }
+
+    for key in ["anyOf", "oneOf", "allOf", "$ref", "not"] {
+        result.removeValue(forKey: key)
+    }
+
+    return result.mapValues(normalizeGemma4ToolSchema)
+}
+
+private func flattenGemma4Composition(in schema: [String: Any]) -> [String: Any] {
+    for key in ["anyOf", "oneOf", "allOf"] {
+        guard let selected = firstNonNullGemma4Branch(schema[key]) else { continue }
+        var merged = selected
+        for (schemaKey, schemaValue) in schema where schemaKey != key {
+            if merged[schemaKey] == nil {
+                merged[schemaKey] = schemaValue
+            }
+        }
+        return merged
+    }
+
+    return schema
+}
+
+private func firstNonNullGemma4Branch(_ value: Any?) -> [String: Any]? {
+    guard let branches = value as? [Any] else { return nil }
+
+    for branch in branches {
+        guard let branchSchema = branch as? [String: Any] else { continue }
+        if (branchSchema["type"] as? String) == "null" {
+            continue
+        }
+        return branchSchema
+    }
+
+    return nil
+}
+
+private func normalizeGemma4Properties(_ properties: [String: Any]) -> [String: Any] {
+    properties.mapValues { value in
+        if let schema = value as? [String: Any] {
+            return normalizeGemma4SchemaObject(schema)
+        }
+        return normalizeGemma4SchemaObject(["default": value])
+    }
+}
+
+private func inferGemma4SchemaType(_ schema: [String: Any]) -> String {
+    if schema["properties"] is [String: Any] {
+        return "object"
+    }
+    if schema["items"] != nil {
+        return "array"
+    }
+    if let enumValues = schema["enum"] as? [Any],
+       let first = enumValues.first(where: { !($0 is NSNull) }) {
+        return inferGemma4ValueType(first)
+    }
+    if let defaultValue = schema["default"] {
+        return inferGemma4ValueType(defaultValue)
+    }
+    return "string"
+}
+
+private func inferGemma4ValueType(_ value: Any) -> String {
+    switch value {
+    case is Bool:
+        return "boolean"
+    case is Int:
+        return "integer"
+    case is Double:
+        return "number"
+    case is [Any]:
+        return "array"
+    case is [String: Any]:
+        return "object"
+    default:
+        return "string"
+    }
+}
+
+private func sendableJSONValue(_ value: Any) -> any Sendable {
+    switch value {
+    case let value as Bool:
+        return value
+    case let value as Int:
+        return value
+    case let value as Double:
+        return value
+    case let value as String:
+        return value
+    case let value as NSNull:
+        return value
+    case let value as [Any]:
+        return value.map(sendableJSONValue)
+    case let value as [String: Any]:
+        return value.mapValues(sendableJSONValue)
+    default:
+        return String(describing: value)
     }
 }
 

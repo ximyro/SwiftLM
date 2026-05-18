@@ -82,6 +82,25 @@ final class ThinkingTagStripTests: XCTestCase {
         XCTAssertEqual(result, "Ехал грека через реку,\nВидит грека — в реке рак.")
     }
 
+    func testExtractThinkingBlock_ImplicitQwenClosingTag() {
+        let (reasoning, content) = extractThinkingBlock(from: "Need the tool.</think><tool_call>{}</tool_call>")
+
+        XCTAssertEqual(reasoning, "Need the tool.")
+        XCTAssertEqual(content, "<tool_call>{}</tool_call>")
+    }
+
+    func testThinkingStateTracker_ImplicitQwenClosingTag() {
+        var tracker = ThinkingStateTracker()
+
+        let first = tracker.process("Need")
+        let second = tracker.process(" the tool.</think>Answer")
+
+        XCTAssertEqual(first.reasoning, "Need")
+        XCTAssertEqual(first.content, "")
+        XCTAssertEqual(second.reasoning, " the tool.")
+        XCTAssertEqual(second.content, "Answer")
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // MARK: - 3. Issue #97 crash reproducer
     // ═══════════════════════════════════════════════════════════════════
@@ -162,4 +181,3 @@ final class ThinkingTagStripTests: XCTestCase {
             "Tool role must be 'tool' for OpenAI function-calling protocol")
     }
 }
-
