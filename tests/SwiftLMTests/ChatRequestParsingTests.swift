@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import MLXLMCommon
 @testable import SwiftLM
 
 final class ChatRequestParsingTests: XCTestCase {
@@ -151,6 +152,185 @@ final class ChatRequestParsingTests: XCTestCase {
         let req = try decode(json)
         let mapped = mapAssistantToolCalls(req.messages[0])
         XCTAssertNil(mapped, "Assistant message with empty tool_calls array should map to nil")
+    }
+
+    func testGeneratedToolCallMissingRequiredArgumentsIsReported() throws {
+        let json = """
+        {
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "read the file" }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": { "type": "string" }
+                            },
+                            "required": ["filePath"]
+                        }
+                    }
+                }
+            ]
+        }
+        """
+
+        let req = try decode(json)
+
+        XCTAssertEqual(
+            missingRequiredToolCallArguments(name: "read", arguments: [:], tools: req.tools),
+            ["filePath"]
+        )
+        XCTAssertNil(
+            missingRequiredToolCallArguments(
+                name: "read",
+                arguments: ["filePath": .string("/tmp/a.go")],
+                tools: req.tools
+            )
+        )
+    }
+
+    func testGeneratedToolCallWithMissingRequiredArgumentsKeepsDiagnosticsForEmission() throws {
+        let req = try decode(globToolRequestJSON())
+        let prepared = prepareToolCallArgumentsForEmission(
+            name: "glob",
+            arguments: [:],
+            tools: req.tools
+        )
+
+        XCTAssertEqual(prepared.arguments, [:])
+        XCTAssertEqual(prepared.missingRequired, ["pattern"])
+        XCTAssertEqual(serializeToolCallArgs(prepared.arguments), "{}")
+    }
+
+    func testGeneratedToolCallFilePathAliasIsNormalized() throws {
+        let req = try decode(readToolRequestJSON())
+
+        let normalized = normalizeToolCallArguments(
+            name: "read",
+            arguments: ["path": .string("/tmp/a.go")],
+            tools: req.tools
+        )
+
+        XCTAssertEqual(normalized["filePath"], .string("/tmp/a.go"))
+        XCTAssertEqual(normalized["path"], .string("/tmp/a.go"))
+        XCTAssertNil(
+            missingRequiredToolCallArguments(
+                name: "read",
+                arguments: normalized,
+                tools: req.tools
+            )
+        )
+    }
+
+    func testGeneratedToolCallFilePathAliasIsEmittableAfterNormalization() throws {
+        let req = try decode(readToolRequestJSON())
+
+        let prepared = prepareToolCallArgumentsForEmission(
+            name: "read",
+            arguments: ["path": .string("/tmp/a.go")],
+            tools: req.tools
+        )
+
+        XCTAssertEqual(prepared.arguments["filePath"], .string("/tmp/a.go"))
+        XCTAssertNil(prepared.missingRequired)
+    }
+
+    func testGeneratedToolCallFilePathAliasDoesNotOverwriteExistingValue() throws {
+        let req = try decode(readToolRequestJSON())
+
+        let normalized = normalizeToolCallArguments(
+            name: "read",
+            arguments: [
+                "filePath": .string("/tmp/existing.go"),
+                "path": .string("/tmp/alias.go"),
+            ],
+            tools: req.tools
+        )
+
+        XCTAssertEqual(normalized["filePath"], .string("/tmp/existing.go"))
+    }
+
+    func testGeneratedToolCallFilePathAliasIsNotGuessedWhenAmbiguous() throws {
+        let req = try decode(readToolRequestJSON())
+
+        let normalized = normalizeToolCallArguments(
+            name: "read",
+            arguments: [
+                "path": .string("/tmp/path.go"),
+                "file": .string("/tmp/file.go"),
+            ],
+            tools: req.tools
+        )
+
+        XCTAssertNil(normalized["filePath"])
+        XCTAssertEqual(
+            missingRequiredToolCallArguments(
+                name: "read",
+                arguments: normalized,
+                tools: req.tools
+            ),
+            ["filePath"]
+        )
+    }
+
+    private func readToolRequestJSON() -> String {
+        """
+        {
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "read the file" }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": { "type": "string" }
+                            },
+                            "required": ["filePath"]
+                        }
+                    }
+                }
+            ]
+        }
+        """
+    }
+
+    private func globToolRequestJSON() -> String {
+        """
+        {
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "find files" }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "glob",
+                        "description": "Find files",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "pattern": { "type": "string" }
+                            },
+                            "required": ["pattern"]
+                        }
+                    }
+                }
+            ]
+        }
+        """
     }
 
     // ═══════════════════════════════════════════════════════════════════
