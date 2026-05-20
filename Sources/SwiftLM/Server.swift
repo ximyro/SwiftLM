@@ -1686,7 +1686,14 @@ func handleChatCompletion(
 /// Matches llama-server's behaviour: thinking tokens → delta.reasoning_content,
 /// response tokens → delta.content (content is nil while thinking).
 struct ThinkingStateTracker {
-    enum Phase { case preThinking, thinking, responding }
+    enum HarmonyChannel { case analysis, final, commentary }
+    enum Phase {
+        case preThinking
+        case thinking
+        case responding
+        case harmonyPreamble(HarmonyChannel)
+        case harmonyMessage(HarmonyChannel)
+    }
     private(set) var phase: Phase = .preThinking
     private var buffer = ""  // accumulates chars looking for tag boundaries
 
@@ -1700,6 +1707,11 @@ struct ThinkingStateTracker {
         while !buffer.isEmpty {
             switch phase {
             case .preThinking:
+                if let (range, channel) = firstHarmonyChannel(in: buffer) {
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .harmonyPreamble(channel)
+                    continue
+                }
                 let startRange = buffer.range(of: "<thinking>") ?? buffer.range(of: "<think>") ?? buffer.range(of: "<|channel>thought\n") ?? buffer.range(of: "<|channel>thought")
                 let endRange = buffer.range(of: "</thinking>") ?? buffer.range(of: "</think>") ?? buffer.range(of: "<channel|>")
 
@@ -1715,7 +1727,7 @@ struct ThinkingStateTracker {
                     content += String(buffer[buffer.startIndex..<range.lowerBound])
                     buffer.removeSubrange(buffer.startIndex..<range.upperBound)
                     phase = .thinking
-                } else if isSuffixOfTag(buffer, tags: ["<think>", "<thinking>", "<|channel>thought\n", "<|channel>thought", "</think>", "</thinking>", "<channel|>"]) {
+                } else if isSuffixOfTag(buffer, tags: ["<think>", "<thinking>", "<|channel>thought\n", "<|channel>thought", "</think>", "</thinking>", "<channel|>", "<|channel|>analysis", "<|channel|>final", "<|channel|>commentary", "<|channel|>", "<|start|>assistant"]) {
                     return (reasoning, content)
                 } else {
                     // Until the first completed thinking delimiter, treat text as
@@ -1725,6 +1737,12 @@ struct ThinkingStateTracker {
                     buffer = ""
                 }
             case .responding:
+                if let (range, channel) = firstHarmonyChannel(in: buffer) {
+                    content += stripHarmonyStructuralTokens(String(buffer[buffer.startIndex..<range.lowerBound]))
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .harmonyPreamble(channel)
+                    continue
+                }
                 let startRange = buffer.range(of: "<thinking>") ?? buffer.range(of: "<think>") ?? buffer.range(of: "<|channel>thought\n") ?? buffer.range(of: "<|channel>thought")
                 if let range = startRange {
                     // Flush text before the tag as response content
@@ -1752,9 +1770,83 @@ struct ThinkingStateTracker {
                     reasoning += buffer
                     buffer = ""
                 }
+            case .harmonyPreamble(let channel):
+                if let messageRange = buffer.range(of: "<|message|>") {
+                    buffer.removeSubrange(buffer.startIndex..<messageRange.upperBound)
+                    phase = .harmonyMessage(channel)
+                } else if isSuffixOfTag(buffer, tags: ["<|message|>", "<|constrain|>", "<|channel|>analysis", "<|channel|>final", "<|channel|>commentary"]) {
+                    return (reasoning, content)
+                } else if let (range, nextChannel) = firstHarmonyChannel(in: buffer) {
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .harmonyPreamble(nextChannel)
+                } else {
+                    // Channel metadata such as ` to=functions.name <|constrain|>json`
+                    // may be split across chunks. Hold it until `<|message|>` arrives.
+                    return (reasoning, content)
+                }
+            case .harmonyMessage(let channel):
+                let endTags = ["<|end|>", "<|return|>", "<|call|>", "<|start|>"]
+                if let range = firstRange(of: endTags, in: buffer) {
+                    appendHarmonyMessage(
+                        String(buffer[buffer.startIndex..<range.lowerBound]),
+                        channel: channel,
+                        reasoning: &reasoning,
+                        content: &content
+                    )
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .preThinking
+                } else if isSuffixOfTag(buffer, tags: endTags) {
+                    return (reasoning, content)
+                } else {
+                    appendHarmonyMessage(buffer, channel: channel, reasoning: &reasoning, content: &content)
+                    buffer = ""
+                }
             }
         }
         return (reasoning, content)
+    }
+
+    private mutating func appendHarmonyMessage(
+        _ text: String,
+        channel: HarmonyChannel,
+        reasoning: inout String,
+        content: inout String
+    ) {
+        switch channel {
+        case .analysis:
+            reasoning += text
+        case .final:
+            content += text
+        case .commentary:
+            break
+        }
+    }
+
+    private func firstHarmonyChannel(in text: String) -> (Range<String.Index>, HarmonyChannel)? {
+        let candidates: [(String, HarmonyChannel)] = [
+            ("<|channel|>analysis", .analysis),
+            ("<|channel|>final", .final),
+            ("<|channel|>commentary", .commentary),
+        ]
+
+        return candidates.compactMap { marker, channel in
+            text.range(of: marker).map { ($0, channel) }
+        }
+        .min { $0.0.lowerBound < $1.0.lowerBound }
+    }
+
+    private func firstRange(of tags: [String], in text: String) -> Range<String.Index>? {
+        tags.compactMap { text.range(of: $0) }
+            .min { $0.lowerBound < $1.lowerBound }
+    }
+
+    private func stripHarmonyStructuralTokens(_ text: String) -> String {
+        var result = text
+        for token in ["<|start|>", "<|end|>", "<|return|>", "<|call|>", "<|message|>", "<|constrain|>"] {
+            result = result.replacingOccurrences(of: token, with: "")
+        }
+        result = result.replacingOccurrences(of: "assistant", with: "")
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func isSuffixOfTag(_ s: String, tags: [String]) -> Bool {
@@ -2126,6 +2218,15 @@ func handleChatNonStreaming(
     }
 
     let totalTokens = promptTokenCount + completionTokenCount
+    if collectedToolCalls.isEmpty,
+       usesLFM2JSONToolFallback(modelId: modelId),
+       let fallbackToolCalls = fallbackToolCallsFromJSONContent(responseContent, tools: tools)
+    {
+        collectedToolCalls = fallbackToolCalls
+        responseContent = ""
+        finishReason = "tool_calls"
+    }
+
     let hasToolCalls = !collectedToolCalls.isEmpty
 
     let resp = ChatCompletionResponse(
@@ -2166,6 +2267,10 @@ func handleChatNonStreaming(
 
 /// Returns (thinkingContent, remainingContent) or (nil, original) if no block found.
 func extractThinkingBlock(from text: String) -> (String?, String) {
+    if let harmony = extractHarmonyBlocks(from: text) {
+        return (harmony.reasoning, harmony.content)
+    }
+
     let startTag = text.range(of: "<thinking>") ?? text.range(of: "<think>") ?? text.range(of: "<|channel>thought\n") ?? text.range(of: "<|channel>thought") ?? (text.hasPrefix("thought\n") ? text.range(of: "thought\n") : nil)
     let endTag = text.range(of: "</thinking>") ?? text.range(of: "</think>") ?? text.range(of: "<channel|>")
     
@@ -2187,6 +2292,69 @@ func extractThinkingBlock(from text: String) -> (String?, String) {
     let thinking = String(text[startRange.upperBound..<endRange.lowerBound])
     let remaining = String(text[endRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
     return (thinking.isEmpty ? nil : thinking, remaining)
+}
+
+func extractHarmonyBlocks(from text: String) -> (reasoning: String?, content: String)? {
+    var searchStart = text.startIndex
+    var reasoningBlocks: [String] = []
+    var finalContent: String?
+    var found = false
+
+    while let channelRange = text.range(of: "<|channel|>", range: searchStart..<text.endIndex) {
+        let channelNameStart = channelRange.upperBound
+        let channel: ThinkingStateTracker.HarmonyChannel
+        let afterChannel = text[channelNameStart..<text.endIndex]
+        if afterChannel.hasPrefix("analysis") {
+            channel = .analysis
+        } else if afterChannel.hasPrefix("final") {
+            channel = .final
+        } else if afterChannel.hasPrefix("commentary") {
+            channel = .commentary
+        } else {
+            searchStart = channelRange.upperBound
+            continue
+        }
+
+        guard let messageRange = text.range(of: "<|message|>", range: channelNameStart..<text.endIndex) else {
+            break
+        }
+
+        let messageStart = messageRange.upperBound
+        let messageEnd = firstRange(
+            of: ["<|end|>", "<|return|>", "<|call|>", "<|start|>"],
+            in: text,
+            range: messageStart..<text.endIndex
+        )?.lowerBound ?? text.endIndex
+        let message = String(text[messageStart..<messageEnd])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        found = true
+        switch channel {
+        case .analysis:
+            if !message.isEmpty {
+                reasoningBlocks.append(message)
+            }
+        case .final:
+            finalContent = message
+        case .commentary:
+            break
+        }
+
+        searchStart = messageEnd
+    }
+
+    guard found else { return nil }
+    let reasoning = reasoningBlocks.isEmpty ? nil : reasoningBlocks.joined(separator: "\n")
+    return (reasoning, finalContent ?? "")
+}
+
+private func firstRange(
+    of needles: [String],
+    in text: String,
+    range: Range<String.Index>
+) -> Range<String.Index>? {
+    needles.compactMap { text.range(of: $0, range: range) }
+        .min { $0.lowerBound < $1.lowerBound }
 }
 
 // ── Text Completions Handler ─────────────────────────────────────────────────
@@ -2776,6 +2944,181 @@ private func requiredToolArguments(
         return required.compactMap { $0 as? String }
     }
     return []
+}
+
+func usesLFM2JSONToolFallback(modelId: String) -> Bool {
+    modelId == "mlx-community/LFM2-8B-A1B-8bit-MLX"
+}
+
+func fallbackToolCallsFromJSONContent(
+    _ content: String,
+    tools: [ChatCompletionRequest.ToolDef]?
+) -> [ToolCallResponse]? {
+    guard let tools, !tools.isEmpty else { return nil }
+
+    let toolNames = Set(tools.compactMap { tool in
+        tool.type == "function" ? tool.function.name : nil
+    })
+    guard !toolNames.isEmpty,
+          let jsonText = extractJSONPayload(from: content),
+          let data = jsonText.data(using: .utf8),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else {
+        return nil
+    }
+
+    if let calls = fallbackOpenAIToolCalls(from: root, toolNames: toolNames, tools: tools) {
+        return calls
+    }
+
+    let keys = Set(root.keys)
+    guard !keys.isEmpty, keys.isSubset(of: toolNames) else {
+        return nil
+    }
+
+    let orderedNames = root.keys.sorted { lhs, rhs in
+        let lhsRange = jsonText.range(of: "\"\(lhs)\"")
+        let rhsRange = jsonText.range(of: "\"\(rhs)\"")
+        switch (lhsRange, rhsRange) {
+        case (.some(let lhsRange), .some(let rhsRange)):
+            return lhsRange.lowerBound < rhsRange.lowerBound
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        case (.none, .none):
+            return lhs < rhs
+        }
+    }
+
+    let calls = orderedNames.compactMap { name -> ToolCallResponse? in
+        guard let rawArgs = root[name] else { return nil }
+        let args = jsonObjectArguments(rawArgs)
+        return toolCallResponse(name: name, arguments: args, tools: tools)
+    }
+
+    return calls.isEmpty ? nil : calls
+}
+
+private func fallbackOpenAIToolCalls(
+    from root: [String: Any],
+    toolNames: Set<String>,
+    tools: [ChatCompletionRequest.ToolDef]
+) -> [ToolCallResponse]? {
+    if let toolCalls = root["tool_calls"] as? [Any] {
+        let calls = toolCalls.compactMap { rawCall -> ToolCallResponse? in
+            guard let call = rawCall as? [String: Any] else { return nil }
+            if let function = call["function"] as? [String: Any],
+               let name = function["name"] as? String,
+               toolNames.contains(name)
+            {
+                let args = jsonObjectArguments(function["arguments"] ?? [:])
+                return toolCallResponse(name: name, arguments: args, tools: tools)
+            }
+            if let name = call["name"] as? String,
+               toolNames.contains(name)
+            {
+                let args = jsonObjectArguments(call["arguments"] ?? [:])
+                return toolCallResponse(name: name, arguments: args, tools: tools)
+            }
+            return nil
+        }
+        return calls.isEmpty ? nil : calls
+    }
+
+    if let name = root["name"] as? String,
+       toolNames.contains(name)
+    {
+        let args = jsonObjectArguments(root["arguments"] ?? [:])
+        return [toolCallResponse(name: name, arguments: args, tools: tools)]
+    }
+
+    return nil
+}
+
+private func extractJSONPayload(from content: String) -> String? {
+    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    if let fenceStart = trimmed.range(of: "```") {
+        let afterFence = trimmed[fenceStart.upperBound...]
+        let payloadStart: String.Index
+        if let newline = afterFence.firstIndex(of: "\n") {
+            payloadStart = trimmed.index(after: newline)
+        } else {
+            payloadStart = fenceStart.upperBound
+        }
+
+        if let fenceEnd = trimmed[payloadStart...].range(of: "```") {
+            return String(trimmed[payloadStart..<fenceEnd.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    guard let start = trimmed.firstIndex(of: "{"),
+          let end = trimmed.lastIndex(of: "}"),
+          start <= end
+    else {
+        return nil
+    }
+
+    return String(trimmed[start...end])
+}
+
+private func jsonObjectArguments(_ rawArgs: Any) -> [String: JSONValue] {
+    if let args = rawArgs as? [String: Any] {
+        return args.mapValues(jsonValue)
+    }
+
+    if let args = rawArgs as? String,
+       let data = args.data(using: .utf8),
+       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    {
+        return object.mapValues(jsonValue)
+    }
+
+    return [:]
+}
+
+private func jsonValue(_ value: Any) -> JSONValue {
+    switch value {
+    case is NSNull:
+        return .null
+    case let value as Bool:
+        return .bool(value)
+    case let value as Int:
+        return .int(value)
+    case let value as Double:
+        return .double(value)
+    case let value as String:
+        return .string(value)
+    case let value as [Any]:
+        return .array(value.map(jsonValue))
+    case let value as [String: Any]:
+        return .object(value.mapValues(jsonValue))
+    default:
+        return .string(String(describing: value))
+    }
+}
+
+private func toolCallResponse(
+    name: String,
+    arguments: [String: JSONValue],
+    tools: [ChatCompletionRequest.ToolDef]
+) -> ToolCallResponse {
+    let preparedArgs = prepareToolCallArgumentsForEmission(
+        name: name, arguments: arguments, tools: tools)
+    if let missingArgs = preparedArgs.missingRequired {
+        print("srv warning: emitting fallback tool_call '\(name)' with missing required arguments: \(missingArgs.joined(separator: ","))")
+    }
+    return ToolCallResponse(
+        id: "call_\(UUID().uuidString.prefix(8))",
+        type: "function",
+        function: ToolCallFunction(
+            name: name,
+            arguments: serializeToolCallArgs(preparedArgs.arguments)
+        )
+    )
 }
 
 // ── OpenAI-compatible types ───────────────────────────────────────────────────

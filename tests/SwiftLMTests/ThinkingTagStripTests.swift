@@ -101,6 +101,32 @@ final class ThinkingTagStripTests: XCTestCase {
         XCTAssertEqual(second.content, "Answer")
     }
 
+    func testExtractThinkingBlock_HarmonyAnalysisAndFinal() {
+        let input = """
+        <|channel|>analysis<|message|>Need answer only.<|end|><|start|>assistant<|channel|>final<|message|>PROMPT_OK
+        """
+
+        let (reasoning, content) = extractThinkingBlock(from: input)
+
+        XCTAssertEqual(reasoning, "Need answer only.")
+        XCTAssertEqual(content, "PROMPT_OK")
+    }
+
+    func testThinkingStateTracker_HarmonyStreamingSplitMarkers() {
+        var tracker = ThinkingStateTracker()
+
+        let first = tracker.process("<|channel|>analysis<|message|>Need")
+        let second = tracker.process(" answer.<|end|><|start|>assistant<|channel|>final")
+        let third = tracker.process("<|message|>PROMPT_OK")
+
+        XCTAssertEqual(first.reasoning, "Need")
+        XCTAssertEqual(first.content, "")
+        XCTAssertEqual(second.reasoning, " answer.")
+        XCTAssertEqual(second.content, "")
+        XCTAssertEqual(third.reasoning, "")
+        XCTAssertEqual(third.content, "PROMPT_OK")
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // MARK: - 3. Issue #97 crash reproducer
     // ═══════════════════════════════════════════════════════════════════
