@@ -130,7 +130,12 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftLMTests",
-            dependencies: ["SwiftLM", "MLXInferenceCore", "DFlash"]
+            dependencies: [
+                "SwiftLM",
+                "MLXInferenceCore",
+                "DFlash",
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ]
         )
     ]
 )
