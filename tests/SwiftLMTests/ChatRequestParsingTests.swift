@@ -279,6 +279,60 @@ final class ChatRequestParsingTests: XCTestCase {
         )
     }
 
+    func testFallbackToolCallsFromFencedToolNameJSON() throws {
+        let req = try decode(opencodeToolRequestJSON())
+        let content = """
+        ```json
+        {
+          "read": {
+            "filePath": "/tmp/repositories.go",
+            "limit": 1000,
+            "offset": 1
+          },
+          "write": {
+            "filePath": "/tmp/float_comparison_tool.go",
+            "newString": "func compareFloats(a, b float64) bool { return math.Abs(a-b) < 1e-9 }",
+            "oldString": "",
+            "replaceAll": true
+          }
+        }
+        ```
+        """
+
+        let calls = try XCTUnwrap(fallbackToolCallsFromJSONContent(content, tools: req.tools))
+
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].function.name, "read")
+        XCTAssertEqual(calls[1].function.name, "write")
+        let readArgs = try decodeArguments(calls[0].function.arguments)
+        let writeArgs = try decodeArguments(calls[1].function.arguments)
+        XCTAssertEqual(readArgs["filePath"] as? String, "/tmp/repositories.go")
+        XCTAssertEqual(writeArgs["replaceAll"] as? Bool, true)
+    }
+
+    func testFallbackToolCallsPreservesBashEscapes() throws {
+        let req = try decode(opencodeToolRequestJSON())
+        let content = #"""
+        {
+          "bash": {
+            "command": "echo \"foo]\\\""
+          }
+        }
+        """#
+
+        let calls = try XCTUnwrap(fallbackToolCallsFromJSONContent(content, tools: req.tools))
+
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0].function.name, "bash")
+        XCTAssertTrue(calls[0].function.arguments.contains(#""command":"echo \"foo]\\\"""#))
+    }
+
+    func testJSONToolFallbackIsLimitedToLFM2A1B8bit() {
+        XCTAssertTrue(usesLFM2JSONToolFallback(modelId: "mlx-community/LFM2-8B-A1B-8bit-MLX"))
+        XCTAssertFalse(usesLFM2JSONToolFallback(modelId: "mlx-community/gemma-4-e4b-it-8bit"))
+        XCTAssertFalse(usesLFM2JSONToolFallback(modelId: "mlx-community/Qwen3.5-9B-6bit"))
+    }
+
     private func readToolRequestJSON() -> String {
         """
         {
@@ -304,6 +358,71 @@ final class ChatRequestParsingTests: XCTestCase {
             ]
         }
         """
+    }
+
+    private func opencodeToolRequestJSON() -> String {
+        """
+        {
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "use tools" }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": { "type": "string" },
+                                "limit": { "type": "integer" },
+                                "offset": { "type": "integer" }
+                            },
+                            "required": ["filePath"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "description": "Write a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": { "type": "string" },
+                                "newString": { "type": "string" },
+                                "oldString": { "type": "string" },
+                                "replaceAll": { "type": "boolean" }
+                            },
+                            "required": ["filePath", "newString"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "Run a shell command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": { "type": "string" }
+                            },
+                            "required": ["command"]
+                        }
+                    }
+                }
+            ]
+        }
+        """
+    }
+
+    private func decodeArguments(_ json: String) throws -> [String: Any] {
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
     private func globToolRequestJSON() -> String {
