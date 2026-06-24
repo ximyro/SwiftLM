@@ -1574,7 +1574,81 @@ func handleChatCompletion(
     await semaphore.wait()
     await stats.requestStarted()
     let genStart = Date()
+    var slotTransferredToGeneration = false
 
+    do {
+        return try await handleChatCompletionWithSlot(
+            chatReq: chatReq,
+            isStream: isStream,
+            jsonMode: jsonMode,
+            emitPrefillProgress: emitPrefillProgress,
+            tokenLimit: tokenLimit,
+            params: params,
+            stopSequences: stopSequences,
+            includeUsage: includeUsage,
+            chatMessages: chatMessages,
+            config: config,
+            container: container,
+            semaphore: semaphore,
+            stats: stats,
+            promptCache: promptCache,
+            draftModelRef: draftModelRef,
+            numDraftTokens: numDraftTokens,
+            dflashModel: dflashModel,
+            dflashBlockSize: dflashBlockSize,
+            dflashTargetModel: dflashTargetModel,
+            toolSpecs: toolSpecs,
+            toolCallFormat: toolCallFormat,
+            genStart: genStart,
+            slotTransferredToGeneration: &slotTransferredToGeneration
+        )
+    } catch {
+        await releaseUntransferredChatSlot(
+            slotTransferred: slotTransferredToGeneration,
+            semaphore: semaphore,
+            stats: stats,
+            genStart: genStart
+        )
+        throw error
+    }
+}
+
+func releaseUntransferredChatSlot(
+    slotTransferred: Bool,
+    semaphore: AsyncSemaphore,
+    stats: ServerStats,
+    genStart: Date
+) async {
+    guard !slotTransferred else { return }
+    await stats.requestFinished(tokens: 0, duration: Date().timeIntervalSince(genStart))
+    await semaphore.signal()
+}
+
+private func handleChatCompletionWithSlot(
+    chatReq: ChatCompletionRequest,
+    isStream: Bool,
+    jsonMode: Bool,
+    emitPrefillProgress: Bool,
+    tokenLimit: Int,
+    params: GenerateParameters,
+    stopSequences: [String],
+    includeUsage: Bool,
+    chatMessages: [Chat.Message],
+    config: ServerConfig,
+    container: ModelContainer,
+    semaphore: AsyncSemaphore,
+    stats: ServerStats,
+    promptCache: PromptCache,
+    draftModelRef: DraftModelRef?,
+    numDraftTokens: Int,
+    dflashModel: DFlashDraftModel?,
+    dflashBlockSize: Int?,
+    dflashTargetModel: (any DFlashTargetModel)?,
+    toolSpecs: [[String: any Sendable]]?,
+    toolCallFormat: ToolCallFormat?,
+    genStart: Date,
+    slotTransferredToGeneration: inout Bool
+) async throws -> Response {
     // Pass enable_thinking to the Jinja chat template via additionalContext.
     // Precedence: top-level request > per-request chat_template_kwargs > server --thinking flag
     var enableThinking: Bool
@@ -1689,6 +1763,7 @@ func handleChatCompletion(
 
         let modelId = config.modelId
         if isStream {
+            slotTransferredToGeneration = true
             return handleChatStreaming(
                 stream: genStream, modelId: modelId, stopSequences: stopSequences,
                 includeUsage: includeUsage, promptTokenCount: promptTokenCount,
@@ -1699,6 +1774,7 @@ func handleChatCompletion(
                 emitPrefillProgress: false, onPrefillDone: nil
             )
         } else {
+            slotTransferredToGeneration = true
             return try await handleChatNonStreaming(
                 stream: genStream, modelId: modelId, stopSequences: stopSequences,
                 promptTokenCount: promptTokenCount, enableThinking: enableThinking,
@@ -1818,6 +1894,7 @@ func handleChatCompletion(
     let modelId = config.modelId
 
     if isStream {
+        slotTransferredToGeneration = true
         return handleChatStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
@@ -1828,6 +1905,7 @@ func handleChatCompletion(
             emitPrefillProgress: emitPrefillProgress, onPrefillDone: onPrefillDone
         )
     } else {
+        slotTransferredToGeneration = true
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
@@ -3788,13 +3866,16 @@ private func normalizeGemma4SchemaObject(_ schema: [String: Any]) -> [String: An
         result.removeValue(forKey: key)
     }
 
-    return result.mapValues(normalizeGemma4ToolSchema)
+    return result
 }
 
 private func flattenGemma4Composition(in schema: [String: Any]) -> [String: Any] {
     for key in ["anyOf", "oneOf", "allOf"] {
         guard let selected = firstNonNullGemma4Branch(schema[key]) else { continue }
         var merged = selected
+        if gemma4CompositionContainsNull(schema[key]) {
+            merged["nullable"] = true
+        }
         for (schemaKey, schemaValue) in schema where schemaKey != key {
             if merged[schemaKey] == nil {
                 merged[schemaKey] = schemaValue
@@ -3811,13 +3892,31 @@ private func firstNonNullGemma4Branch(_ value: Any?) -> [String: Any]? {
 
     for branch in branches {
         guard let branchSchema = branch as? [String: Any] else { continue }
-        if (branchSchema["type"] as? String) == "null" {
+        if gemma4SchemaTypeContainsNull(branchSchema["type"]) {
             continue
         }
         return branchSchema
     }
 
     return nil
+}
+
+private func gemma4CompositionContainsNull(_ value: Any?) -> Bool {
+    guard let branches = value as? [Any] else { return false }
+    return branches.contains { branch in
+        guard let branchSchema = branch as? [String: Any] else { return false }
+        return gemma4SchemaTypeContainsNull(branchSchema["type"])
+    }
+}
+
+private func gemma4SchemaTypeContainsNull(_ value: Any?) -> Bool {
+    if let type = value as? String {
+        return type == "null"
+    }
+    if let types = value as? [Any] {
+        return types.contains { ($0 as? String) == "null" }
+    }
+    return value is NSNull
 }
 
 private func normalizeGemma4Properties(_ properties: [String: Any]) -> [String: Any] {

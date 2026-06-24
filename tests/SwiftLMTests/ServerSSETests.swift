@@ -120,4 +120,31 @@ final class ServerSSETests: XCTestCase {
         // is irrelevant to correctness. We capture the current contract here.
         // If a post-done guard is added later, add XCTAssertNotEqual(await state.nPast, 999).
     }
+
+    func testUntransferredChatSlotIsReleasedAfterPrepareFailure() async {
+        let semaphore = AsyncSemaphore(limit: 1)
+        let stats = ServerStats()
+
+        await semaphore.wait()
+        await stats.requestStarted()
+
+        await releaseUntransferredChatSlot(
+            slotTransferred: false,
+            semaphore: semaphore,
+            stats: stats,
+            genStart: Date()
+        )
+
+        let snapshot = await stats.snapshot()
+        XCTAssertEqual(snapshot.requestsActive, 0)
+
+        let reacquire = Task {
+            await semaphore.wait()
+            return true
+        }
+
+        let reacquired = await reacquire.value
+        XCTAssertTrue(reacquired)
+        await semaphore.signal()
+    }
 }
