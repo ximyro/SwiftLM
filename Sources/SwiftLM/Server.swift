@@ -2564,7 +2564,6 @@ func handleChatCompletion(
     let slot = GenerationSlot(semaphore: semaphore)
     await stats.requestStarted()
     let genStart = Date()
-
     // Pass enable_thinking to the Jinja chat template via additionalContext.
     // Precedence: top-level request > per-request chat_template_kwargs > server --thinking flag
     var enableThinking: Bool
@@ -5289,13 +5288,16 @@ private func normalizeGemma4SchemaObject(_ schema: [String: Any]) -> [String: An
         result.removeValue(forKey: key)
     }
 
-    return result.mapValues(normalizeGemma4ToolSchema)
+    return result
 }
 
 private func flattenGemma4Composition(in schema: [String: Any]) -> [String: Any] {
     for key in ["anyOf", "oneOf", "allOf"] {
         guard let selected = firstNonNullGemma4Branch(schema[key]) else { continue }
         var merged = selected
+        if gemma4CompositionContainsNull(schema[key]) {
+            merged["nullable"] = true
+        }
         for (schemaKey, schemaValue) in schema where schemaKey != key {
             if merged[schemaKey] == nil {
                 merged[schemaKey] = schemaValue
@@ -5312,13 +5314,31 @@ private func firstNonNullGemma4Branch(_ value: Any?) -> [String: Any]? {
 
     for branch in branches {
         guard let branchSchema = branch as? [String: Any] else { continue }
-        if (branchSchema["type"] as? String) == "null" {
+        if gemma4SchemaTypeContainsNull(branchSchema["type"]) {
             continue
         }
         return branchSchema
     }
 
     return nil
+}
+
+private func gemma4CompositionContainsNull(_ value: Any?) -> Bool {
+    guard let branches = value as? [Any] else { return false }
+    return branches.contains { branch in
+        guard let branchSchema = branch as? [String: Any] else { return false }
+        return gemma4SchemaTypeContainsNull(branchSchema["type"])
+    }
+}
+
+private func gemma4SchemaTypeContainsNull(_ value: Any?) -> Bool {
+    if let type = value as? String {
+        return type == "null"
+    }
+    if let types = value as? [Any] {
+        return types.contains { ($0 as? String) == "null" }
+    }
+    return value is NSNull
 }
 
 private func normalizeGemma4Properties(_ properties: [String: Any]) -> [String: Any] {

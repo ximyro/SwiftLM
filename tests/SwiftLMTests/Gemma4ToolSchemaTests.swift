@@ -85,6 +85,82 @@ final class Gemma4ToolSchemaTests: XCTestCase {
         XCTAssertNil(items["anyOf"])
     }
 
+    func testGemma4DoesNotTreatPropertiesMapAsSchema() throws {
+        let request = try decodeRequest(
+            parameters: """
+            {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "File path"
+                }
+              },
+              "required": ["path"]
+            }
+            """
+        )
+
+        let properties = try propertiesSchema(from: request, format: .gemma4)
+        XCTAssertNil(properties["type"], "properties map must only contain tool parameters, not a synthetic schema type")
+
+        let path = try XCTUnwrap(properties["path"] as? [String: any Sendable])
+        XCTAssertEqual(path["type"] as? String, "string")
+    }
+
+    func testGemma4NormalizesOpencodeStyleNestedSchema() throws {
+        let request = try decodeRequest(
+            parameters: """
+            {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "description": "Command to run"
+                },
+                "arguments": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "anyOf": [
+                          { "type": "string" },
+                          { "type": "number" },
+                          { "type": "null" }
+                        ]
+                      }
+                    },
+                    "required": ["value"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["command"]
+            }
+            """
+        )
+
+        let properties = try propertiesSchema(from: request, format: .gemma4)
+        XCTAssertNil(properties["type"], "nested properties must not be re-normalized as a schema")
+
+        let command = try XCTUnwrap(properties["command"] as? [String: any Sendable])
+        XCTAssertEqual(command["type"] as? String, "string")
+
+        let arguments = try XCTUnwrap(properties["arguments"] as? [String: any Sendable])
+        XCTAssertEqual(arguments["type"] as? String, "array")
+
+        let items = try XCTUnwrap(arguments["items"] as? [String: any Sendable])
+        XCTAssertEqual(items["type"] as? String, "object")
+
+        let itemProperties = try XCTUnwrap(items["properties"] as? [String: any Sendable])
+        XCTAssertNil(itemProperties["type"], "array item properties must only contain declared fields")
+
+        let value = try XCTUnwrap(itemProperties["value"] as? [String: any Sendable])
+        XCTAssertEqual(value["type"] as? String, "string")
+        XCTAssertEqual(value["nullable"] as? Bool, true)
+        XCTAssertNil(value["anyOf"])
+    }
+
     func testNonGemmaKeepsOriginalSchemaShape() throws {
         let request = try decodeRequest(
             parameters: """
@@ -137,5 +213,15 @@ final class Gemma4ToolSchemaTests: XCTestCase {
         let parameters = try XCTUnwrap(function["parameters"] as? [String: any Sendable])
         let properties = try XCTUnwrap(parameters["properties"] as? [String: any Sendable])
         return try XCTUnwrap(properties[name] as? [String: any Sendable])
+    }
+
+    private func propertiesSchema(
+        from request: ChatCompletionRequest,
+        format: ToolCallFormat
+    ) throws -> [String: any Sendable] {
+        let tools = try XCTUnwrap(makeTemplateToolSpecs(request.tools, toolCallFormat: format))
+        let function = try XCTUnwrap(tools[0]["function"] as? [String: any Sendable])
+        let parameters = try XCTUnwrap(function["parameters"] as? [String: any Sendable])
+        return try XCTUnwrap(parameters["properties"] as? [String: any Sendable])
     }
 }
