@@ -3,6 +3,15 @@
 **Date**: April 3, 2026
 **Goal**: Resolve startup crashes for `mlx-community/gemma-4-26b-a4b-it-4bit` on Apple Silicon.
 
+## 2026-06-24 — Fix Gemma 4 tool prompt deadlock
+
+**Milestone:** SwiftLM Gemma 4 compatibility
+**Status:** done
+
+- Fixed Gemma 4 tool schema normalization so nested OpenAI/opencode-style tool schemas no longer trigger `upper filter requires string` in the model chat template.
+- Added guarded chat slot cleanup so pre-generation failures after `semaphore.wait()` do not leave `parallel=1` servers stuck with `requests_active=1`.
+- Verified with targeted Swift tests and manual `mlx-community/gemma-4-12B-it-6bit` non-streaming, tool-bearing, and streaming requests.
+
 ## 🏔️ The Journey
 
 ### 1. Identifying the Root Cause
