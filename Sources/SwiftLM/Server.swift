@@ -1355,6 +1355,7 @@ actor PromptCache {
         let tokens: [Int]            // Full token sequence that generated this KV state
         let states: [[MLXArray]]     // Per-layer KV state arrays
         let metaStates: [[String]]   // Per-layer metadata
+        let offsets: [Int]           // Per-layer KVCache.offset at snapshot time
     }
 
     private var cached: CachedState?
@@ -1366,10 +1367,13 @@ actor PromptCache {
     /// produce lazy computation graphs (e.g. TurboKV decode → reshape → concatenate).
     /// If not materialized now, those lazy references point to the live cache tensors
     /// which get overwritten by subsequent requests, causing stale data / SIGTRAP on restore.
+    /// NOTE on hybrid (recurrent-state) models: MambaCache state integrates the whole
+    /// sequence and cannot be trimmed, so this MUST be called when the cache covers
+    /// exactly `tokens` — the hybrid path in handleChatCompletion calls it mid-prefill
+    /// at the last message boundary, before any decode step. The attention-only path
+    /// may keep calling it after the first token because KVCacheSimple is sliced back
+    /// to P below.
     func save(tokens: [Int], cache: [KVCache]) {
-        if cache.contains(where: { $0 is MambaCache }) {
-            return
-        }
         let P = tokens.count
         // For attention KVCacheSimple layers, the state tensor is [B, H, T, D] with a
         // pre-allocated T that can exceed the actual prompt length P. If we store the
@@ -1386,47 +1390,37 @@ actor PromptCache {
                     return arr
                 }
             }
-            return s
+            // Everything else (MambaCache slots, RotatingKVCache rings, …): deep-copy —
+            // the state getters may return references to live buffers that in-place
+            // updates mutate after the snapshot.
+            return s.map { $0[.ellipsis] }
         }
         let metaStates = cache.map { $0.metaState }
+        let offsets = cache.map { $0.offset }
         // Materialize all lazy MLX arrays so they survive cache mutations
         let allArrays = states.flatMap { $0 }
         if !allArrays.isEmpty {
             eval(allArrays)
         }
-        cached = CachedState(tokens: tokens, states: states, metaStates: metaStates)
+        cached = CachedState(tokens: tokens, states: states, metaStates: metaStates, offsets: offsets)
     }
 
     /// Find the longest common prefix between `newTokens` and the cached sequence.
     /// Restores matched KV state, trims any excess — mirrors llama-server behaviour.
     /// Returns the number of matched tokens, or nil on a complete miss.
     func restore(newTokens: [Int], into cache: [KVCache]) -> Int? {
-        // MambaCache/RNN states cannot be arbitrarily rolled back or safely saved
-        // after the fact without exact sequence-boundary synchronization.
-        // Disable prompt caching entirely for hybrid models (e.g. Qwen3Next).
-        if cache.contains(where: { $0 is MambaCache }) {
-            misses += 1
-            return nil
-        }
-
         guard let cached, !cached.tokens.isEmpty else {
             misses += 1
             return nil
         }
-        // ── Recurrent-layer safety gate ──
-        // MambaCache (and other recurrent caches) store a 2-D hidden state with no
-        // T dimension, so the dim(2) read below would crash. Hybrid Mamba/attention
-        // models (Qwen-Next, Mamba-2, etc.) can't be safely prefix-restored because
-        // the recurrent hidden state was computed over the WHOLE previous sequence
-        // and there is no trim(excess) operator for it. Treat any cache containing
-        // a recurrent layer as a miss before we touch anything.
-        let hasRecurrentLayer = cache.contains { layer in
-            !(layer is KVCacheSimple) && !(String(describing: type(of: layer)).contains("Rotating"))
-        }
-        if hasRecurrentLayer {
-            misses += 1
-            return nil
-        }
+        // ── Non-trimmable-layer gate ──
+        // Recurrent caches (MambaCache) integrate the WHOLE sequence into a fixed-size
+        // hidden state, and sliding-window rings (RotatingKVCache) overwrite their
+        // history once rotated — neither can be rolled back to an arbitrary prefix.
+        // They CAN be reused when the snapshot (taken at the last message boundary,
+        // see startStream in handleChatCompletion) is a strict prefix of the new
+        // prompt: restore the state as-is and prefill only the suffix.
+        let hasNonTrimmableLayer = cache.contains { !($0 is KVCacheSimple) }
         // Token-by-token longest common prefix scan
         var matchLen = 0
         for (a, b) in zip(cached.tokens, newTokens) {
@@ -1442,6 +1436,16 @@ actor PromptCache {
         // fewer tokens than the full prompt (e.g. 1440 vs 5537). If the trim
         // would zero-out any layer, bail BEFORE touching the live cache.
         let excess = cached.tokens.count - matchLen
+        if hasNonTrimmableLayer {
+            // Exact-prefix extension only: no trim possible (excess > 0), and a
+            // full match would need the trim(1) replay trick non-trimmable state
+            // can't do (matchLen == newTokens.count).
+            guard excess == 0, matchLen < newTokens.count else {
+                print("[SwiftLM] 🗂 Prompt cache MISS (non-trimmable): snapshot=\(cached.tokens.count)t lcp=\(matchLen)t request=\(newTokens.count)t — exact-prefix extension required")
+                misses += 1
+                return nil
+            }
+        }
         if excess > 0 {
             // The state getter stores keys as the first element: [B, H, T, D]
             // dim(2) = T = the number of cached tokens for that layer.
@@ -1460,7 +1464,13 @@ actor PromptCache {
         for i in 0..<min(cache.count, cached.states.count) {
             var layer = cache[i]
             layer.state = cached.states[i]
-            layer.metaState = cached.metaStates[i]
+            if layer is ArraysCache {
+                // Slot-based caches restore positionally via the state setter;
+                // ArraysCache's metaState setter asserts, so restore offset directly.
+                (layer as? BaseKVCache)?.offset = cached.offsets[i]
+            } else {
+                layer.metaState = cached.metaStates[i]
+            }
         }
         if excess > 0 {
             for layer in cache { layer.trim(excess) }
@@ -1597,6 +1607,7 @@ func handleChatCompletion(
             dflashModel: dflashModel,
             dflashBlockSize: dflashBlockSize,
             dflashTargetModel: dflashTargetModel,
+            mtpAssistant: mtpAssistant,
             toolSpecs: toolSpecs,
             toolCallFormat: toolCallFormat,
             genStart: genStart,
@@ -1644,6 +1655,7 @@ private func handleChatCompletionWithSlot(
     dflashModel: DFlashDraftModel?,
     dflashBlockSize: Int?,
     dflashTargetModel: (any DFlashTargetModel)?,
+    mtpAssistant: (any DualModelMTP)?,
     toolSpecs: [[String: any Sendable]]?,
     toolCallFormat: ToolCallFormat?,
     genStart: Date,
@@ -1660,31 +1672,9 @@ private func handleChatCompletionWithSlot(
         enableThinking = config.thinking  // fall back to server --thinking flag
     }
 
-    // Workaround for Gemma-4 Tool-Call bug (Resolves https://github.com/SharpAI/SwiftLM/issues/69)
-    // If tools are present, the Gemma-4 Jinja template appends an anti-thinking prefix
-    // (`<|channel>thought\n<channel|>`) when enable_thinking=false. This forcibly suppresses
-    // the reasoning channel, flattening the first-token output distribution at the `<|tool_call>`
-    // vs `text` decision point, resulting in complete failure (garbage tokens, Korean repeats,
-    // or ignoring tools entirely) on vague requests.
-    //
-    // Fix: Unconditionally enable the thinking channel when tools are provided, giving the
-    // Gemma-4 router time to process the system prompt before deciding to emit a tool_call.
-    //
-    // Coverage details:
-    // - Tested Model: `mlx-community/gemma-4-26b-a4b-it-4bit`
-    // - Verification: Verified via `run_benchmark.sh` (Test 8) using dynamic `tool_call` regression mapping.
-    //                 The test covers vague query fallback (graceful TEXT handling bypassing degeneration)
-    //                 and explicit query execution (driven via structured System Prompt conditioning).
-    // - Known Limitations: While this logic repairs expected 4-bit decoding structures, evaluating at
-    //                    zero-temperature (`temp=0.0`) without active repetition penalties can inherently 
-    //                    induce repeating loop failure vectors beyond the purview of this fix.
-    if chatReq.enableThinking == nil,
-       chatReq.chatTemplateKwargs?["enable_thinking"] == nil,
-       toolSpecs?.isEmpty == false,
-       toolCallFormat == .gemma4
-    {
-        enableThinking = true
-    }
+    // Do not auto-enable Gemma-4 thinking just because tools are present. The
+    // operator-level --without-reasoning/default-disabled setting must remain
+    // authoritative; explicit per-request enable_thinking=true is handled above.
 
     // The Jinja template evaluates `not enable_thinking | default(false)`. If we pass nil instead of
     // true, it evaluates to false and still breaks. We MUST explicitly pass the boolean.
@@ -1816,6 +1806,80 @@ private func handleChatCompletionWithSlot(
         // produced with KVCacheSimple; restoring it into a QuantizedKVCache (or vice-versa)
         // is unsafe and produces incorrect results or runtime failures.
         let skipPromptCache = isMultimodalRequest || params.kvBits != nil
+
+        // ── Non-trimmable caches: exact-boundary prompt caching ──
+        // Recurrent state (MambaCache) and rotated sliding-window rings
+        // (RotatingKVCache) can't be trimmed, so the save-after-first-token used for
+        // plain-attention models would snapshot at prompt+k tokens (the producer runs
+        // ahead of the stream consumer) — an unrecoverable boundary. Instead, build
+        // the TokenIterator ourselves: its init runs the full prefill synchronously,
+        // so we control exactly how many tokens the cache covers when we snapshot.
+        // Then hand the iterator to the same pump MLXLMCommon.generate uses.
+        let hasNonTrimmableCache = cache.contains { !($0 is KVCacheSimple) }
+        let startStream: (LMInput) async throws -> AsyncStream<Generation> = { effInput in
+            guard hasNonTrimmableCache && !skipPromptCache else {
+                return try MLXLMCommon.generate(
+                    input: effInput, cache: cache, parameters: params, context: context
+                )
+            }
+            // Snapshot at the last message boundary (just after the final EOS /
+            // <|im_end|> token), not at the full prompt: the trailing generation
+            // scaffold (e.g. Qwen's empty <think> block when thinking is disabled)
+            // does not recur in the next request's rendering of the conversation,
+            // so a full-prompt snapshot could never match — and recurrent state
+            // cannot be trimmed back over it. Prefill up to the boundary, snapshot,
+            // then hand the scaffold tail to the TokenIterator.
+            var input = effInput
+            let effCount = effInput.text.tokens.size
+            let startOffset = promptTokens.count - effCount
+            var boundary = promptTokens.count
+            var messageEndIds = Set<Int>()
+            if let eosId = context.tokenizer.eosTokenId {
+                messageEndIds.insert(eosId)
+            }
+            // Template families whose message terminator is not the EOS token.
+            for token in ["<|im_end|>", "<end_of_turn>"] {
+                if let id = context.tokenizer.convertTokenToId(token) {
+                    messageEndIds.insert(id)
+                }
+            }
+            if let lastEnd = promptTokens.lastIndex(where: { messageEndIds.contains($0) }) {
+                boundary = lastEnd + 1
+            }
+            let localBoundary = boundary - startOffset
+            if localBoundary > 0 && localBoundary < effCount {
+                let head = LMInput(tokens: effInput.text.tokens[..<localBoundary])
+                let preparation = try context.model.prepare(
+                    head, cache: cache, windowSize: params.prefillStepSize)
+                if case .tokens(let remainder) = preparation {
+                    // Feed the prepare() remainder so the cache covers exactly
+                    // `boundary` tokens before the snapshot.
+                    _ = context.model(
+                        remainder[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil)
+                }
+                let turboCompressed = cache.contains { layer in
+                    if let simple = layer as? KVCacheSimple {
+                        return simple.turboQuantEnabled && simple.compressedOffset > 0
+                    }
+                    return false
+                }
+                if !turboCompressed {
+                    await promptCache.save(
+                        tokens: Array(promptTokens[..<boundary]), cache: cache)
+                }
+                input = LMInput(tokens: effInput.text.tokens[localBoundary...])
+            }
+            let iterator = try TokenIterator(
+                input: input, model: context.model, cache: cache, parameters: params
+            )
+            let (s, _) = MLXLMCommon.generateTask(
+                promptTokenCount: effInput.text.tokens.size,
+                modelConfiguration: context.configuration,
+                tokenizer: context.tokenizer,
+                iterator: iterator
+            )
+            return s
+        }
         var stream: AsyncStream<Generation>
         if let draftRef = draftModelRef {
             // Speculative decoding path: draft model generates candidates, main model verifies.
@@ -1844,9 +1908,7 @@ private func handleChatCompletionWithSlot(
                     input: trimmedInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
                 )
             } else {
-                stream = try MLXLMCommon.generate(
-                    input: trimmedInput, cache: cache, parameters: params, context: context
-                )
+                stream = try await startStream(trimmedInput)
             }
         } else {
             // Cache miss: process the full prompt.
@@ -1855,9 +1917,7 @@ private func handleChatCompletionWithSlot(
                     input: lmInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
                 )
             } else {
-                stream = try MLXLMCommon.generate(
-                    input: lmInput, cache: cache, parameters: params, context: context
-                )
+                stream = try await startStream(lmInput)
             }
         }
         
@@ -1884,6 +1944,10 @@ private func handleChatCompletionWithSlot(
                 // kv_bits is set: the cache contains QuantizedKVCache layers whose token
                 // format is incompatible with the FP16 KVCacheSimple format expected by
                 // promptCache.save. Skip saving to prevent unsafe mixed-format restores.
+            } else if hasNonTrimmableCache {
+                // Non-trimmable caches were snapshotted at the last message boundary
+                // in startStream. Saving here would capture state at prompt+k
+                // tokens, which cannot be rolled back.
             } else {
                 await promptCache.save(tokens: promptTokens, cache: cache)
             }
@@ -1925,6 +1989,7 @@ private func handleChatCompletionWithSlot(
 struct ThinkingStateTracker {
     enum HarmonyChannel { case analysis, final, commentary }
     enum Phase {
+        case preThinking
         case thinking
         case responding
         case harmonyPreamble(HarmonyChannel)
@@ -1941,8 +2006,8 @@ struct ThinkingStateTracker {
     /// - Parameter startInThinking: true when the chat template already emitted an
     ///   unclosed opening tag at the end of the prompt, so the model's first token
     ///   is reasoning rather than response text (issue #108).
-    init(startInThinking: Bool = false) {
-        self.phase = startInThinking ? .thinking : .responding
+    init(startInThinking: Bool? = nil) {
+        self.phase = startInThinking.map { $0 ? .thinking : .responding } ?? .preThinking
     }
 
     /// Whether a rendered prompt ends inside an unclosed thinking block.
@@ -1983,6 +2048,36 @@ struct ThinkingStateTracker {
 
         while !buffer.isEmpty {
             switch phase {
+            case .preThinking:
+                if let (range, channel) = firstHarmonyChannel(in: buffer) {
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .harmonyPreamble(channel)
+                    continue
+                }
+                let startRange = Self.firstRange(in: buffer, of: Self.openTags)
+                let endRange = Self.firstRange(in: buffer, of: Self.closeTags)
+                if let endRange,
+                   startRange == nil || endRange.lowerBound < startRange!.lowerBound
+                {
+                    reasoning += String(buffer[buffer.startIndex..<endRange.lowerBound])
+                    buffer.removeSubrange(buffer.startIndex..<endRange.upperBound)
+                    phase = .responding
+                } else if let range = startRange {
+                    content += String(buffer[buffer.startIndex..<range.lowerBound])
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .thinking
+                } else if isSuffixOfTag(
+                    buffer,
+                    tags: Self.openTags + Self.closeTags + [
+                        "<|channel|>analysis", "<|channel|>final", "<|channel|>commentary",
+                        "<|channel|>", "<|start|>assistant",
+                    ]
+                ) {
+                    return (reasoning, content)
+                } else {
+                    reasoning += buffer
+                    buffer = ""
+                }
             case .responding:
                 if let (range, channel) = firstHarmonyChannel(in: buffer) {
                     content += stripHarmonyStructuralTokens(String(buffer[buffer.startIndex..<range.lowerBound]))
@@ -2061,7 +2156,7 @@ struct ThinkingStateTracker {
         defer { buffer = "" }
         guard !buffer.isEmpty else { return ("", "") }
         switch phase {
-        case .thinking, .harmonyMessage(.analysis):
+        case .preThinking, .thinking, .harmonyMessage(.analysis):
             return (buffer, "")
         case .responding, .harmonyMessage(.final):
             return ("", buffer)
@@ -2246,6 +2341,19 @@ func handleChatStreaming(
                 }
                 print(text, terminator: "")
                 fflush(stdout)
+
+                if !enableThinking, shouldStopGemma4ThoughtScaffolding(fullText) {
+                    cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: "stop"))
+                    let genDur = Date().timeIntervalSince(genStart)
+                    let genTokPerSec = genDur > 0 ? Double(completionTokenCount) / genDur : 0
+                    if includeUsage {
+                        cont.yield(sseUsageChunk(modelId: modelId, promptTokens: promptTokenCount, completionTokens: completionTokenCount, tokPerSec: genTokPerSec, durationMs: genDur * 1000))
+                    }
+                    cont.yield("data: [DONE]\r\n\r\n")
+                    cont.finish()
+                    stopped = true
+                    continue
+                }
 
                 // ── JSON mode buffering: accumulate early tokens, strip prefix, then flush ──
                 if jsonBuffering {
@@ -2483,11 +2591,15 @@ func handleChatNonStreaming(
     var tcIndex = 0
     var generationStopReason: GenerateStopReason = .stop
     var firstToken = true
-    for await generation in stream {
+    generationLoop: for await generation in stream {
         switch generation {
         case .chunk(let text, _):
             fullText += text
             completionTokenCount += 1
+            if !enableThinking, shouldStopGemma4ThoughtScaffolding(fullText) {
+                generationStopReason = .stop
+                break generationLoop
+            }
             // GPU yield: prevent Metal from starving macOS WindowServer
             if completionTokenCount % 8 == 0 {
                 try? await Task.sleep(for: .microseconds(50))
@@ -2552,6 +2664,9 @@ func handleChatNonStreaming(
             reasoningContent = extracted
             responseContent = remaining
         }
+    } else if isGemma4ThoughtScaffoldingOnly(fullText) {
+        responseContent = ""
+        finishReason = "stop"
     }
 
     // ── JSON mode validation ──
@@ -2642,9 +2757,10 @@ func extractThinkingBlock(from text: String, alreadyOpen: Bool = false) -> (Stri
 
     guard let startRange = startTag else {
         if let endRange = endTag {
-            let thinking = String(text[..<endRange.lowerBound])
             let remaining = String(text[endRange.upperBound...])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard remaining.hasPrefix("<tool_call>") else { return (nil, text) }
+            let thinking = String(text[..<endRange.lowerBound])
             return (thinking.isEmpty ? nil : thinking, remaining)
         }
         return (nil, text)
@@ -3152,6 +3268,24 @@ func checkStopSequences(_ text: String, stopSequences: [String]) -> (String, Str
     }
     guard let earliest else { return nil }
     return (String(text[text.startIndex..<earliest.index]), earliest.stop)
+}
+
+func isGemma4ThoughtScaffoldingOnly(_ text: String) -> Bool {
+    let markerCount = text.components(separatedBy: "<|channel>thought").count - 1
+    guard markerCount > 0 else { return false }
+
+    let stripped = text
+        .replacingOccurrences(of: "<|channel>thought\n", with: "")
+        .replacingOccurrences(of: "<|channel>thought", with: "")
+        .replacingOccurrences(of: "<channel|>", with: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    return stripped.isEmpty
+}
+
+func shouldStopGemma4ThoughtScaffolding(_ text: String) -> Bool {
+    let markerCount = text.components(separatedBy: "<|channel>thought").count - 1
+    return markerCount >= 2 && isGemma4ThoughtScaffoldingOnly(text)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
