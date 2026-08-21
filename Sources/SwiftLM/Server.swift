@@ -662,6 +662,9 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable TurboQuant KV-cache compression (3-bit PolarQuant+QJL). Compresses KV history > 8192 tokens to ~3.5 bits/token — recommended for 100k+ context. Default: disabled")
     var turboKV: Bool = false
 
+    @Flag(name: .long, help: "Pin the first eligible system-prompt KV prefix for normal text generation (not vision/audio, kv_bits, MTP, draft, or DFlash)")
+    var pinSystemPrompt: Bool = false
+
     @Option(name: .long, help: "Chunk size for prefill evaluation (default: 512, lower to prevent GPU timeout on large models)")
     var prefillSize: Int = 512
 
@@ -1458,6 +1461,7 @@ struct MLXServer: AsyncParsableCommand {
             isVision: loadedAsVision,
             prefillSize: self.prefillSize,
             turboKV: self.turboKV,
+            pinSystemPrompt: self.pinSystemPrompt,
             mtp: self.mtp,
             numMtpTokens: self.numMtpTokens,
             mtpAssistantModel: self.mtpAssistantModel
@@ -1491,8 +1495,9 @@ struct MLXServer: AsyncParsableCommand {
         let thinkingStr = config.thinking ? "enabled" : "disabled"
         let ssdStr = self.streamExperts ? "enabled" : "disabled"
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
+        let pinSystemPromptStr = config.pinSystemPrompt ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
-        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
+        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), pin_system_prompt=\(pinSystemPromptStr), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
         if config.turboKV, let ctx = config.ctxSize {
             print("[SwiftLM] ⚠️  --turbo-kv has no effect with --ctx-size \(ctx): a bounded context gives the attention layers a RotatingKVCache, and TurboKV only compresses KVCacheSimple. Drop --ctx-size to use --turbo-kv.")
         }
@@ -1781,6 +1786,7 @@ struct ServerConfig: Sendable {
     let prefillSize: Int
     /// When true, each KVCacheSimple layer compresses history > 8192 tokens to 3-bit PolarQuant.
     let turboKV: Bool
+    let pinSystemPrompt: Bool
     let mtp: Bool
     let numMtpTokens: Int
     let mtpAssistantModel: String?
@@ -1912,6 +1918,7 @@ actor PromptCache {
         let tokens: [Int]            // Full token sequence that generated this KV state
         let states: [[MLXArray]]     // Per-layer KV state arrays
         let metaStates: [[String]]   // Per-layer metadata
+        let offsets: [Int]
         /// Hybrid entries only: earlier recurrent states, ascending by position, each
         /// strictly before `tokens.count` (the entry's own state covers that one).
         var checkpoints: [RecurrentCheckpoint] = []
@@ -1923,6 +1930,8 @@ actor PromptCache {
     /// Most recently used first. Holds at most `maxEntries`.
     private var entries: [CachedState] = []
     private let maxEntries: Int
+    private var pinned: CachedState?
+    private var pinClaim: UUID?
     private var hits: Int = 0
     private var misses: Int = 0
 
@@ -2027,6 +2036,52 @@ actor PromptCache {
         // Nothing can restore an empty prompt, and it would only take a slot.
         guard !tokens.isEmpty else { return }
         let P = tokens.count
+        let snapshot = snapshot(tokens: tokens, cache: cache)
+        let metaStates = snapshot.metaStates
+        // An entry the new one dominates goes: a conversation replaces its own previous turn
+        // instead of filling the cache. Entries are homogeneous within a run (the generic
+        // path refuses recurrent layers), so the new state's kind also describes the entries
+        // being compared. The near-prefix rule needs a state that restores at any prefix.
+        let exactPrefixOnly = allowRecurrent
+            || !Self.canRewindToAnyPrefix(cache: cache, metaStates: metaStates)
+        // Read the resumed-from entry before the removal below drops it.
+        let carried = allowRecurrent
+            ? inheritedCheckpoints(tokens: tokens, resumedFrom: resumedFrom, cache: cache) : []
+        let merged = Self.mergedCheckpoints(carried + checkpoints, before: P)
+        entries.removeAll {
+            Self.isSuperseded($0.tokens, by: tokens, exactPrefixOnly: exactPrefixOnly)
+        }
+        entries.insert(
+            CachedState(tokens: tokens, states: snapshot.states, metaStates: metaStates, offsets: snapshot.offsets, checkpoints: merged),
+            at: 0)
+        if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
+    }
+
+    /// Atomically reserve the write-once pinned slot before probe/prefill work begins.
+    func claimPinnedSnapshot() -> UUID? {
+        guard pinned == nil, pinClaim == nil else { return nil }
+        let claim = UUID()
+        pinClaim = claim
+        return claim
+    }
+
+    func releasePinnedClaim(_ claim: UUID) {
+        if pinned == nil, pinClaim == claim { pinClaim = nil }
+    }
+
+    /// Commit the claimed system-prefix snapshot for the server lifetime.
+    @discardableResult
+    func savePinned(claim: UUID, tokens: [Int], cache: [KVCache]) -> Bool {
+        guard pinned == nil, pinClaim == claim else { return false }
+        pinned = snapshot(tokens: tokens, cache: cache)
+        pinClaim = nil
+        return true
+    }
+
+    func hasPinnedSnapshot() -> Bool { pinned != nil }
+
+    private func snapshot(tokens: [Int], cache: [KVCache]) -> CachedState {
+        let P = tokens.count
         // For attention KVCacheSimple layers, the state tensor is [B, H, T, D] with a
         // pre-allocated T that can exceed the actual prompt length P. If we store the
         // full over-sized buffer, restore()'s trim() by (cached.tokens.count - matchLen)
@@ -2052,23 +2107,7 @@ actor PromptCache {
         if !allArrays.isEmpty {
             eval(allArrays)
         }
-        // An entry the new one dominates goes: a conversation replaces its own previous turn
-        // instead of filling the cache. Entries are homogeneous within a run (the generic
-        // path refuses recurrent layers), so the new state's kind also describes the entries
-        // being compared. The near-prefix rule needs a state that restores at any prefix.
-        let exactPrefixOnly = allowRecurrent
-            || !Self.canRewindToAnyPrefix(cache: cache, metaStates: metaStates)
-        // Read the resumed-from entry before the removal below drops it.
-        let carried = allowRecurrent
-            ? inheritedCheckpoints(tokens: tokens, resumedFrom: resumedFrom, cache: cache) : []
-        let merged = Self.mergedCheckpoints(carried + checkpoints, before: P)
-        entries.removeAll {
-            Self.isSuperseded($0.tokens, by: tokens, exactPrefixOnly: exactPrefixOnly)
-        }
-        entries.insert(
-            CachedState(tokens: tokens, states: states, metaStates: metaStates, checkpoints: merged),
-            at: 0)
-        if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
+        return CachedState(tokens: tokens, states: states, metaStates: metaStates, offsets: cache.map { $0.offset })
     }
 
     /// Checkpoints of the entry a restore resumed from, up to `resumedFrom`, plus that
@@ -2129,56 +2168,43 @@ actor PromptCache {
     /// Find the cached entry with the longest usable common prefix with `newTokens`.
     /// Restores matched KV state, trims any excess — mirrors llama-server behaviour.
     /// Returns the number of matched tokens, or nil on a complete miss.
-    func restore(newTokens: [Int], into cache: [KVCache]) -> Int? {
-        // MambaCache/RNN states cannot be arbitrarily rolled back or safely saved
-        // after the fact without exact sequence-boundary synchronization.
-        // Disable prompt caching entirely for hybrid models (e.g. Qwen3Next).
-        if cache.contains(where: { $0 is MambaCache }) {
-            misses += 1
-            return nil
-        }
-
-        // ── Recurrent-layer safety gate ──
-        // MambaCache (and other recurrent caches) store a 2-D hidden state with no
-        // T dimension, so the dim(2) read below would crash. Hybrid Mamba/attention
-        // models (Qwen-Next, Mamba-2, etc.) can't be safely prefix-restored because
-        // the recurrent hidden state was computed over the WHOLE previous sequence
-        // and there is no trim(excess) operator for it. Treat any cache containing
-        // a recurrent layer as a miss before we touch anything.
-        let hasRecurrentLayer = cache.contains { layer in
-            !(layer is KVCacheSimple) && !(String(describing: type(of: layer)).contains("Rotating"))
-        }
-        if hasRecurrentLayer {
-            misses += 1
-            return nil
-        }
+    func restore(newTokens: [Int], into cache: [KVCache], allowPinned: Bool = true) -> Int? {
+        let candidates = entries + (allowPinned ? pinned.map { [$0] } ?? [] : [])
+        let hasRecurrent = cache.contains { !($0 is KVCacheSimple) && !($0 is RotatingKVCache) }
         var best: (index: Int, matchLen: Int)?
-        for (i, entry) in entries.enumerated() {
-            if let m = usableMatch(entry, newTokens: newTokens, cache: cache),
-               m > (best?.matchLen ?? 0)
-            {
-                best = (i, m)
+        for (i, entry) in candidates.enumerated() {
+            guard entry.states.count == cache.count else { continue }
+            let match: Int?
+            if hasRecurrent {
+                match = entry.tokens.count < newTokens.count && newTokens.starts(with: entry.tokens)
+                    ? entry.tokens.count : nil
+            } else {
+                match = usableMatch(entry, newTokens: newTokens, cache: cache)
             }
+            if let m = match, m > (best?.matchLen ?? 0) { best = (i, m) }
         }
         guard let (index, matchLen) = best else {
             misses += 1
             return nil
         }
-        let cached = entries.remove(at: index)
-        entries.insert(cached, at: 0)
+        let cached = candidates[index]
+        if index < entries.count {
+            entries.remove(at: index)
+            entries.insert(cached, at: 0)
+        }
         let excess = cached.tokens.count - matchLen
-        // Safe to restore: trim won't corrupt any layer. Detach so decode steps on the
-        // live cache cannot write through into the saved snapshot.
-        for i in 0..<min(cache.count, cached.states.count) {
+        for i in cache.indices {
             var layer = cache[i]
             layer.state = cached.states[i].map(detachedArray)
-            layer.metaState = cached.metaStates[i]
+            if layer is ArraysCache {
+                (layer as? BaseKVCache)?.offset = cached.offsets[i]
+            } else {
+                layer.metaState = cached.metaStates[i]
+            }
         }
-        if excess > 0 {
-            for layer in cache { layer.trim(excess) }
-        }
+        if excess > 0 { for layer in cache { layer.trim(excess) } }
         hits += 1
-        print("[SwiftLM] \u{1F5C2} Prompt cache HIT: \(matchLen)/\(newTokens.count) tokens reused (\(excess > 0 ? "partial" : "full") match)")
+        print("[SwiftLM] Prompt cache HIT: \(matchLen)/\(newTokens.count) tokens reused")
         return matchLen
     }
 
@@ -2222,7 +2248,8 @@ actor PromptCache {
     /// `cache`), or nil on a miss.
     func restoreExactPrefix(newTokens: [Int], limit: Int, into cache: [KVCache]) -> Int? {
         var best: (index: Int, length: Int, checkpoint: RecurrentCheckpoint?)?
-        for (i, e) in entries.enumerated() {
+        let candidates = entries + (pinned.map { [$0] } ?? [])
+        for (i, e) in candidates.enumerated() {
             guard let r = hybridResumePoint(e, newTokens: newTokens, limit: limit, cache: cache),
                   r.length > (best?.length ?? 0)
             else { continue }
@@ -2232,8 +2259,11 @@ actor PromptCache {
             misses += 1
             return nil
         }
-        let cached = entries.remove(at: index)
-        entries.insert(cached, at: 0)
+        let cached = candidates[index]
+        if index < entries.count {
+            entries.remove(at: index)
+            entries.insert(cached, at: 0)
+        }
         for (i, layer) in cache.enumerated() {
             var layer = layer
             layer.state = cached.states[i].map(detachedArray)
@@ -2383,6 +2413,21 @@ func rotatingCacheBoundary(promptTokens: [Int], turnStartIds: [Int?]) -> Int {
     let ids = Set(turnStartIds.compactMap { $0 })
     if let b = promptTokens.lastIndex(where: { ids.contains($0) }), b > 0 { return b }
     return promptTokens.count
+}
+
+func systemPromptCacheBoundary(
+    promptTokens: [Int],
+    probeTokens: [Int],
+    replayTokenCount: Int = 8,
+    minimumTokenCount: Int = 16
+) -> Int? {
+    let commonPrefix = zip(promptTokens, probeTokens).prefix { $0 == $1 }.count
+    let boundary = max(0, commonPrefix - replayTokenCount)
+    return boundary >= minimumTokenCount && boundary < promptTokens.count ? boundary : nil
+}
+
+func promptTokenSlice(_ tokens: MLXArray, from start: Int, to end: Int) -> MLXArray {
+    tokens[.ellipsis, start..<end]
 }
 
 // ── Request Body Extraction ──────────────────────────────────────────────────
@@ -2700,6 +2745,56 @@ func handleChatCompletion(
         return (genStream, nil)
     }
 
+    // Render a system+dummy-user probe once to find the template-aware token boundary
+    // shared by independent requests with the same leading system prompt. The normal
+    // generation path snapshots the cache at this exact boundary below.
+    var systemPinBoundary: Int?
+    var systemPinClaim: UUID?
+    let hasLeadingSystemPrompt = chatReq.messages.first.map {
+        $0.role == "system" && !$0.textContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    } ?? false
+    if config.pinSystemPrompt,
+       hasLeadingSystemPrompt,
+       draftModelRef == nil,
+       !config.mtp,
+       !config.turboKV,
+       !config.isVision,
+       params.kvBits == nil,
+       lmInput.image == nil,
+       lmInput.audio == nil,
+       lmInput.video == nil
+    {
+        if let claim = await promptCache.claimPinnedSnapshot() {
+            systemPinClaim = claim
+            do {
+                let probeMessages: [Chat.Message] = [
+                    .system(chatMessages[0].content),
+                    .user("__swiftlm_system_prompt_pin_probe__"),
+                ]
+                let probeInput = try await container.prepare(input: UserInput(
+                    chat: probeMessages,
+                    tools: toolSpecs,
+                    additionalContext: templateContext
+                ))
+                if let boundary = systemPromptCacheBoundary(
+                    promptTokens: promptTokens,
+                    probeTokens: probeInput.text.tokens.asArray(Int.self)
+                ) {
+                    systemPinBoundary = boundary
+                } else {
+                    await promptCache.releasePinnedClaim(claim)
+                    systemPinClaim = nil
+                }
+            } catch {
+                await promptCache.releasePinnedClaim(claim)
+                systemPinClaim = nil
+                print("[SwiftLM] System prompt pin probe failed; continuing without pinning: \(error)")
+            }
+        }
+    }
+    let requestedSystemPinBoundary = systemPinBoundary
+    let requestedSystemPinClaim = systemPinClaim
+
     // ── Cache-aware generation (standard path) ──
     let (stream, onPrefillDone) = try await container.perform { context -> (AsyncStream<Generation>, (() async -> Void)?) in
         let cache = try context.model.newCache(parameters: params)
@@ -2749,6 +2844,23 @@ func handleChatCompletion(
             isMultimodalRequest: isMultimodalRequest, kvBitsSet: params.kvBits != nil,
             isVLM: isVLM, vlmTextCacheSafe: vlmTextCacheSafe)
         let promptLength = promptTokens.count
+        if let claim = requestedSystemPinClaim {
+            if !skipPromptCache, let boundary = requestedSystemPinBoundary {
+                do {
+                    _ = try TokenIterator(
+                        input: LMInput(text: sliceText(lmInput.text, from: 0, to: boundary)),
+                        model: context.model, cache: cache, parameters: params)
+                    _ = await promptCache.savePinned(
+                        claim: claim, tokens: Array(promptTokens[..<boundary]), cache: cache)
+                } catch {
+                    await promptCache.releasePinnedClaim(claim)
+                    throw error
+                }
+            } else {
+                await promptCache.releasePinnedClaim(claim)
+            }
+        }
+
 
         // ── Hybrid (recurrent + attention) prompt cache ──
         // Qwen3.5/3.6-style models pair MambaCache (linear attention) with KVCacheSimple
@@ -2845,7 +2957,10 @@ func handleChatCompletion(
                 input: lmInput, cache: cache, parameters: params, context: context,
                 draftModel: draftRef.model, numDraftTokens: numDraftTokens
             )
-        } else if !skipPromptCache, let cachedCount = await promptCache.restore(newTokens: promptTokens, into: cache) {
+        } else if !skipPromptCache,
+                  let cachedCount = await promptCache.restore(
+                    newTokens: promptTokens, into: cache, allowPinned: !config.mtp)
+        {
             // Cache hit: KV state is pre-populated up to cachedCount tokens.
             // Only compute the remaining (new) tokens.
             var startIndex = cachedCount
