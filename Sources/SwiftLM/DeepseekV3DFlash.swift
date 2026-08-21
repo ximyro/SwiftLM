@@ -20,6 +20,7 @@ import MLXNN
 // MARK: - Configuration
 
 struct DSV3Config: Codable, Sendable {
+    var outerModelType: String?
     var vocabSize: Int
     var hiddenSize: Int
     var intermediateSize: Int
@@ -75,6 +76,55 @@ struct DSV3Config: Codable, Sendable {
         case ropeScaling = "rope_scaling"
         case attentionBias = "attention_bias"
     }
+
+    enum WrapperCodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case textConfig = "text_config"
+    }
+
+    init(from decoder: Decoder) throws {
+        let wrapper = try decoder.container(keyedBy: WrapperCodingKeys.self)
+        let outerModelType = try wrapper.decodeIfPresent(String.self, forKey: .modelType)
+        if wrapper.contains(.textConfig) {
+            let nestedDecoder = try wrapper.superDecoder(forKey: .textConfig)
+            self = try DSV3Config(fromFlat: nestedDecoder)
+            self.outerModelType = outerModelType
+        } else {
+            self = try DSV3Config(fromFlat: decoder)
+            self.outerModelType = outerModelType
+        }
+    }
+
+    private init(fromFlat decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        vocabSize = try container.decode(Int.self, forKey: .vocabSize)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
+        numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
+        numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+        numKeyValueHeads = try container.decode(Int.self, forKey: .numKeyValueHeads)
+        nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
+        nRoutedExperts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts)
+        routedScalingFactor = try container.decode(Float.self, forKey: .routedScalingFactor)
+        kvLoraRank = try container.decode(Int.self, forKey: .kvLoraRank)
+        qLoraRank = try container.decodeIfPresent(Int.self, forKey: .qLoraRank)
+        qkRopeHeadDim = try container.decode(Int.self, forKey: .qkRopeHeadDim)
+        vHeadDim = try container.decode(Int.self, forKey: .vHeadDim)
+        qkNopeHeadDim = try container.decode(Int.self, forKey: .qkNopeHeadDim)
+        normTopkProb = try container.decode(Bool.self, forKey: .normTopkProb)
+        nGroup = try container.decodeIfPresent(Int.self, forKey: .nGroup)
+        topkGroup = try container.decodeIfPresent(Int.self, forKey: .topkGroup)
+        numExpertsPerTok = try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok)
+        moeLayerFreq = try container.decode(Int.self, forKey: .moeLayerFreq)
+        firstKDenseReplace = try container.decode(Int.self, forKey: .firstKDenseReplace)
+        maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
+        rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+        ropeScaling = try container.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
+        attentionBias = try container.decode(Bool.self, forKey: .attentionBias)
+        outerModelType = nil
+    }
 }
 
 // MARK: - Helpers
@@ -117,7 +167,7 @@ private class DSV3Attention: Module {
 
         if let r = config.qLoraRank {
             _qAProj.wrappedValue = Linear(config.hiddenSize, r, bias: config.attentionBias)
-            _qALayerNorm.wrappedValue = RMSNorm(dimensions: r)
+            _qALayerNorm.wrappedValue = RMSNorm(dimensions: r, eps: 1e-6)
             _qBProj.wrappedValue = Linear(r, numHeads * qHeadDim, bias: false)
         } else {
             _qProj.wrappedValue = Linear(config.hiddenSize, numHeads * qHeadDim, bias: false)
@@ -125,7 +175,7 @@ private class DSV3Attention: Module {
 
         _kvAProjWithMqa.wrappedValue = Linear(
             config.hiddenSize, kvLoraRank + qkRopeHeadDim, bias: config.attentionBias)
-        _kvALayerNorm.wrappedValue = RMSNorm(dimensions: kvLoraRank)
+        _kvALayerNorm.wrappedValue = RMSNorm(dimensions: kvLoraRank, eps: 1e-6)
         _kvBProj.wrappedValue = Linear(
             kvLoraRank, numHeads * (qHeadDim - qkRopeHeadDim + vHeadDim), bias: false)
         _oProj.wrappedValue = Linear(numHeads * vHeadDim, config.hiddenSize, bias: config.attentionBias)
@@ -243,19 +293,24 @@ private class DSV3MoEGate: Module {
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let (bsz, seqLen, _) = (x.dim(0), x.dim(1), x.dim(2))
         let hiddenStates = x.matmul(weight.T)
-        var scores = sigmoid(hiddenStates)
-        let scoresForChoice = scores + e_score_correction_bias
-        let groupScores = scoresForChoice.reshaped(bsz, seqLen, nGroup, -1)
-        let topKGroup = top(groupScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
-        let k = nGroup - topkGroup
-        var groupIdx = argPartition(topKGroup, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
-        groupIdx = broadcast(groupIdx, to: [bsz, seqLen, k, nRoutedExperts / nGroup])
-        scores = putAlong(groupScores, stopGradient(groupIdx), values: MLXArray(0.0), axis: -2)
-        scores = flattened(scores, start: -2, end: -1)
-        let inds = argPartition(-scores, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
-        scores = takeAlong(scores, inds, axis: -1)
+        let originalScores = sigmoid(hiddenStates.asType(.float32))
+        var selectionScores = originalScores + e_score_correction_bias
+        if nGroup > 1 {
+            selectionScores = selectionScores.reshaped(bsz, seqLen, nGroup, -1)
+            let groupScores = top(selectionScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
+            let skippedGroupCount = nGroup - topkGroup
+            let groupIdx = argPartition(groupScores, kth: skippedGroupCount - 1, axis: -2)[
+                .ellipsis, ..<skippedGroupCount, 0...]
+            selectionScores = putAlong(
+                selectionScores, stopGradient(groupIdx), values: MLXArray(0.0), axis: -2)
+            selectionScores = flattened(selectionScores, start: -2, end: -1)
+        }
+        let inds = argPartition(-selectionScores, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        var scores = takeAlong(originalScores, inds, axis: -1)
         if topK > 1, normTopkProb {
             scores = scores / (scores.sum(axis: -1, keepDims: true) + 1e-20) * routedScalingFactor
+        } else {
+            scores = scores * routedScalingFactor
         }
         return (inds, scores)
     }
@@ -392,6 +447,7 @@ public class DeepseekV3DFlashModel: Module, LLMModel, KVCacheDimensionProvider, 
 
     init(_ args: DSV3Config) {
         self.args = args
+        self.kvHeads = Array(repeating: args.numKeyValueHeads, count: args.numHiddenLayers)
         _inner.wrappedValue = DSV3ModelInner(config: args)
         _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
@@ -401,13 +457,21 @@ public class DeepseekV3DFlashModel: Module, LLMModel, KVCacheDimensionProvider, 
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        // Strip HuggingFace VLM wrapper prefix present in some checkpoints (e.g. kimi_k25).
+        let isKimiVL = args.outerModelType == "kimi_vl"
         let llmPrefix = "language_model."
-        var weights = weights.count > 0 && weights.keys.first!.hasPrefix(llmPrefix)
-            ? Dictionary(uniqueKeysWithValues: weights.map { k, v in
-                (k.hasPrefix(llmPrefix) ? String(k.dropFirst(llmPrefix.count)) : k, v)
-              })
-            : weights
+        var normalizedWeights: [String: MLXArray] = [:]
+        for (key, value) in weights {
+            if isKimiVL,
+                key.hasPrefix("vision_tower.") || key.hasPrefix("multi_modal_projector.")
+            {
+                continue
+            }
+            let strippedKey = key.hasPrefix(llmPrefix)
+                ? String(key.dropFirst(llmPrefix.count))
+                : key
+            normalizedWeights[strippedKey] = value
+        }
+        let weights = normalizedWeights
 
         var w = weights
 

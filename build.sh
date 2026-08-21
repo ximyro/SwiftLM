@@ -16,7 +16,7 @@ echo "=============================================="
 # --- 1. Submodules ---
 echo ""
 echo "=> [1/4] Initializing submodules..."
-# git submodule update --init --recursive
+git -C mlx-swift submodule update --init --recursive
 
 # --- 2. Check for cmake and resolve Swift dependencies ---
 echo ""
@@ -38,15 +38,15 @@ echo "   cmake: $(cmake --version | head -1)"
 echo ""
 echo "=> [3/4] Building Metal kernels (mlx.metallib)..."
 
-if [ -d "mlx-swift/Source/Cmlx/mlx" ]; then
+if [ -f "mlx-swift/Source/Cmlx/mlx/CMakeLists.txt" ]; then
     MLX_SRC="mlx-swift/Source/Cmlx/mlx"
-elif [ -d ".build/checkouts/mlx-swift/Source/Cmlx/mlx" ]; then
+elif [ -f ".build/checkouts/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt" ]; then
     MLX_SRC=".build/checkouts/mlx-swift/Source/Cmlx/mlx"
 else
     echo "❌ Could not locate mlx-swift sources."
     echo "   Expected one of:"
-    echo "   - mlx-swift/Source/Cmlx/mlx"
-    echo "   - .build/checkouts/mlx-swift/Source/Cmlx/mlx"
+    echo "   - mlx-swift/Source/Cmlx/mlx/CMakeLists.txt"
+    echo "   - .build/checkouts/mlx-swift/Source/Cmlx/mlx/CMakeLists.txt"
     echo "   Make sure submodules are initialized."
     exit 1
 fi
