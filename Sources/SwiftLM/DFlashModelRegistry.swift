@@ -30,6 +30,12 @@ func registerDFlashModelTypes() async {
         return DeepseekV3DFlashModel(config)
     }
 
+    // Kimi-VL wraps a DeepSeek V3 text decoder under text_config/language_model.
+    await registry.registerModelType("kimi_vl") { data in
+        let config = try JSONDecoder.json5().decode(DSV3Config.self, from: data)
+        return DeepseekV3DFlashModel(config)
+    }
+
     // Kimi linear — hybrid KDA/MLA architecture (kimi 2.6).
     await registry.registerModelType("kimi_linear") { data in
         let config = try JSONDecoder.json5().decode(KimiLinearConfiguration.self, from: data)

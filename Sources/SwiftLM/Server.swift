@@ -1837,8 +1837,9 @@ private func handleChatCompletionWithSlot(
             if let eosId = context.tokenizer.eosTokenId {
                 messageEndIds.insert(eosId)
             }
-            // Template families whose message terminator is not the EOS token.
-            for token in ["<|im_end|>", "<end_of_turn>"] {
+            // Template families whose message terminator is not the EOS token:
+            // ChatML/Qwen, Gemma 3 / non-unified Gemma 4, unified Gemma 4.
+            for token in ["<|im_end|>", "<end_of_turn>", "<turn|>"] {
                 if let id = context.tokenizer.convertTokenToId(token) {
                     messageEndIds.insert(id)
                 }
