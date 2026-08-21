@@ -3,19 +3,14 @@ import MLX
 import MLXLMCommon
 @testable import SwiftLM
 
-// MARK: - Regression tests for PR #85 -- prompt-cache bleed fixes
+// MARK: - Prompt-cache regression tests
 //
 // These tests protect the PromptCache actor's save/restore contract WITHOUT
 // downloading any model. We create synthetic KVCache instances with tiny
 // MLXArray tensors ([1, 2, T, 4]) and exercise every guard directly.
 //
-// What this locks in:
-//   1. MambaCache gate in save() and restore()       -- PR #85 fix 1
-//   2. T-dim slice to P in save()                    -- PR #85 fix 2
-//   3. ndim >= 3 guard in restore() minSeqLen scan   -- PR #85 fix 3
-//   4. Recurrent-layer detection in restore()        -- PR #85 fix 4
-//   5. Spec-decode-first ordering (logic test)       -- PR #85 fix 5
-//   6. skipPromptCache guard (logic test)            -- PR #85 fix 6
+// This locks in rolling and pinned snapshot selection, trimmable-cache slicing,
+// exact-prefix handling for recurrent caches, and cache-path branch ordering.
 
 final class PromptCacheTests: XCTestCase {
 
@@ -31,21 +26,30 @@ final class PromptCacheTests: XCTestCase {
         return cache
     }
 
+    func testPromptTokenSliceUsesSequenceAxis() {
+        let tokens = MLXArray(Array(0..<10)).reshaped(1, 10)
+
+        let prefix = promptTokenSlice(tokens, from: 0, to: 6)
+        let suffix = promptTokenSlice(tokens, from: 6, to: 10)
+
+        XCTAssertEqual(prefix.shape, [1, 6])
+        XCTAssertEqual(suffix.shape, [1, 4])
+    }
+
     // MARK: - Group 1: save() guards
 
-    /// PR #85 fix 1: save() must skip entirely when any layer is MambaCache.
-    func testSave_SkipsMambaCache() async {
+    /// Recurrent snapshots are reusable when their full token sequence is a strict prefix.
+    func testSave_MambaCacheSupportsExactPrefixExtension() async {
         let pc = PromptCache()
         let simpleLayer = makePopulatedSimpleCache(seqLen: 10)
         let mambaLayer = MambaCache()
 
         await pc.save(tokens: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], cache: [simpleLayer, mambaLayer])
 
-        // Restore into a non-Mamba cache so a miss validates save() skipped persistence,
-        // rather than restore() taking its own MambaCache early-exit.
-        let freshCache = [KVCacheSimple()] as [any KVCache]
-        let result = await pc.restore(newTokens: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], into: freshCache)
-        XCTAssertNil(result, "save() should be a no-op when any source layer is MambaCache")
+        let freshCache = [KVCacheSimple(), MambaCache()] as [any KVCache]
+        let result = await pc.restore(
+            newTokens: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], into: freshCache)
+        XCTAssertEqual(result, 10)
     }
 
     /// PR #85 fix 2: save() must slice KVCacheSimple state T-dim to exactly P tokens.
@@ -101,35 +105,28 @@ final class PromptCacheTests: XCTestCase {
 
     // MARK: - Group 2: restore() guards
 
-    /// PR #85 fix 1 (restore side): restore must reject when target cache has MambaCache.
-    func testRestore_SkipsMambaCache() async {
+    /// A full recurrent-cache match is unusable because generation must replay one token.
+    func testRestore_MambaCacheRequiresStrictExtension() async {
         let pc = PromptCache()
-        // Save with pure KVCacheSimple
         let saveCache = makePopulatedSimpleCache(seqLen: 5)
-        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [saveCache])
+        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [saveCache, MambaCache()])
 
-        // Restore into a cache that includes MambaCache
         let restoreCache: [any KVCache] = [KVCacheSimple(), MambaCache()]
         let result = await pc.restore(newTokens: [1, 2, 3, 4, 5], into: restoreCache)
-        XCTAssertNil(result, "MambaCache in target cache -> restore must return nil (miss)")
+        XCTAssertNil(result, "A non-trimmable full match cannot replay the final token")
 
         let stats = await pc.stats()
         XCTAssertEqual(stats.misses, 1)
     }
 
-    /// PR #85 fix 4: restore must detect non-KVCacheSimple/non-RotatingKVCache layers
-    /// (recurrent layers like ArraysCache) and bail.
-    func testRestore_SkipsRecurrentLayer() async {
+    /// ArraysCache follows the same strict-extension rule as MambaCache.
+    func testRestore_ArraysCacheRequiresStrictExtension() async {
         let pc = PromptCache()
-        // Save with KVCacheSimple
-        let saveCache = makePopulatedSimpleCache(seqLen: 5)
-        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [saveCache])
+        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [ArraysCache(size: 2)])
 
-        // Restore into a cache with ArraysCache (recurrent, but not MambaCache)
-        let recurrentLayer = ArraysCache(size: 2)
-        let restoreCache: [any KVCache] = [recurrentLayer]
+        let restoreCache: [any KVCache] = [ArraysCache(size: 2)]
         let result = await pc.restore(newTokens: [1, 2, 3, 4, 5], into: restoreCache)
-        XCTAssertNil(result, "Recurrent layer (ArraysCache) -> restore must bail")
+        XCTAssertNil(result, "A non-trimmable full match cannot replay the final token")
     }
 
     /// Basic happy path: save and restore with identical tokens -> full match.
@@ -204,7 +201,120 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertEqual(stats.misses, 1, "Zero-match bail must increment miss counter")
     }
 
-    // MARK: - Group 3: Decision branch ordering (pure logic tests)
+    // MARK: - Group 3: Pinned system prompt
+
+    func testPinnedSnapshotIsWriteOnceAndSurvivesRollingSave() async {
+        let pc = PromptCache()
+        let claimed = await pc.claimPinnedSnapshot()
+        guard let claim = claimed else { return XCTFail("Expected to claim pinned slot") }
+        let firstPin = await pc.savePinned(
+            claim: claim, tokens: [1, 2, 3],
+            cache: [makePopulatedSimpleCache(seqLen: 3)])
+        let secondPin = await pc.savePinned(
+            claim: claim, tokens: [9, 8, 7],
+            cache: [makePopulatedSimpleCache(seqLen: 3)])
+        await pc.save(tokens: [20, 21, 22, 23], cache: [makePopulatedSimpleCache(seqLen: 4)])
+        let hasPinnedSnapshot = await pc.hasPinnedSnapshot()
+
+        XCTAssertNotNil(claimed)
+        XCTAssertTrue(firstPin)
+        XCTAssertFalse(secondPin)
+        XCTAssertTrue(hasPinnedSnapshot)
+
+        let restored: [any KVCache] = [KVCacheSimple()]
+        let result = await pc.restore(newTokens: [1, 2, 3, 4], into: restored)
+        XCTAssertEqual(result, 3)
+    }
+
+    func testRestorePrefersLongerRollingMatchOverPinnedMatch() async {
+        let pc = PromptCache()
+        guard let claim = await pc.claimPinnedSnapshot() else {
+            return XCTFail("Expected to claim pinned slot")
+        }
+        _ = await pc.savePinned(
+            claim: claim, tokens: [1, 2],
+            cache: [makePopulatedSimpleCache(seqLen: 2)])
+        await pc.save(
+            tokens: [1, 2, 3, 4], cache: [makePopulatedSimpleCache(seqLen: 4)])
+
+        let restored: [any KVCache] = [KVCacheSimple()]
+        let result = await pc.restore(newTokens: [1, 2, 3, 99], into: restored)
+        XCTAssertEqual(result, 3)
+    }
+
+    func testPinnedSnapshotCanBeExcludedFromRestore() async {
+        let pc = PromptCache()
+        guard let claim = await pc.claimPinnedSnapshot() else {
+            return XCTFail("Expected to claim pinned slot")
+        }
+        _ = await pc.savePinned(
+            claim: claim, tokens: [1, 2, 3],
+            cache: [makePopulatedSimpleCache(seqLen: 3)])
+
+        let restored: [any KVCache] = [KVCacheSimple()]
+        let result = await pc.restore(
+            newTokens: [1, 2, 3, 4], into: restored, allowPinned: false)
+        XCTAssertNil(result)
+    }
+
+    func testPinnedSnapshotClaimIsExclusiveAndReleasable() async {
+        let pc = PromptCache()
+        async let first = pc.claimPinnedSnapshot()
+        async let second = pc.claimPinnedSnapshot()
+        let claims = await [first, second]
+        let successfulClaims = claims.compactMap { $0 }
+
+        XCTAssertEqual(successfulClaims.count, 1)
+        guard let activeClaim = successfulClaims.first else { return }
+        await pc.releasePinnedClaim(activeClaim)
+        let reclaimed = await pc.claimPinnedSnapshot()
+        XCTAssertNotNil(reclaimed)
+    }
+
+    func testStaleReleaseCannotClearNewPinnedClaim() async {
+        let pc = PromptCache()
+        guard let first = await pc.claimPinnedSnapshot() else {
+            return XCTFail("Expected first claim")
+        }
+        await pc.releasePinnedClaim(first)
+        guard let second = await pc.claimPinnedSnapshot() else {
+            return XCTFail("Expected second claim")
+        }
+
+        await pc.releasePinnedClaim(first)
+        let claimWhileSecondIsActive = await pc.claimPinnedSnapshot()
+        XCTAssertNil(claimWhileSecondIsActive)
+
+        await pc.releasePinnedClaim(second)
+        let claimAfterSecondRelease = await pc.claimPinnedSnapshot()
+        XCTAssertNotNil(claimAfterSecondRelease)
+    }
+
+    func testSystemPromptBoundaryAppliesReplayMargin() {
+        let prompt = Array(0..<40)
+        let probe = Array(0..<30) + [999]
+        XCTAssertEqual(systemPromptCacheBoundary(promptTokens: prompt, probeTokens: probe), 22)
+    }
+
+    func testSystemPromptBoundaryRejectsShortPrefix() {
+        let prompt = Array(0..<40)
+        let probe = Array(0..<23) + [999]
+        XCTAssertNil(systemPromptCacheBoundary(promptTokens: prompt, probeTokens: probe))
+    }
+
+    func testPinSystemPromptFlagDefaultsOff() throws {
+        let command = try MLXServer.parse(["--model", "test-model"])
+        XCTAssertFalse(command.pinSystemPrompt)
+    }
+
+    func testPinSystemPromptFlagCanBeEnabled() throws {
+        let command = try MLXServer.parse([
+            "--model", "test-model", "--pin-system-prompt",
+        ])
+        XCTAssertTrue(command.pinSystemPrompt)
+    }
+
+    // MARK: - Group 4: Decision branch ordering (pure logic tests)
 
     /// PR #85 fix 6: skipPromptCache must be true when multimodal.
     func testSkipPromptCache_Multimodal() {
@@ -272,7 +382,7 @@ final class PromptCacheTests: XCTestCase {
             "Without draft model, cache hit should be the chosen path")
     }
 
-    // MARK: - Group 4: Stats tracking
+    // MARK: - Group 5: Stats tracking
 
     /// Hit/miss counters must accumulate correctly.
     func testStats_AccumulateCorrectly() async {
