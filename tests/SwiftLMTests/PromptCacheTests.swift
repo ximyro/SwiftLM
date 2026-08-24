@@ -497,6 +497,17 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertEqual(enabled.hybridCacheEntries, 3)
     }
 
+    func testQwen35DefaultsToTextUnlessVisionIsExplicit() {
+        XCTAssertTrue(qwen35TextOnlyByDefault(
+            modelType: "qwen3_5", explicitVision: false))
+        XCTAssertTrue(qwen35TextOnlyByDefault(
+            modelType: "Qwen3.5", explicitVision: false))
+        XCTAssertFalse(qwen35TextOnlyByDefault(
+            modelType: "qwen3_5", explicitVision: true))
+        XCTAssertFalse(qwen35TextOnlyByDefault(
+            modelType: "qwen3_5_moe", explicitVision: false))
+    }
+
     func testHybridCacheEntriesRejectsNegativeValues() {
         XCTAssertThrowsError(try MLXServer.parse([
             "--model", "test-model", "--hybrid-cache-entries=-1",

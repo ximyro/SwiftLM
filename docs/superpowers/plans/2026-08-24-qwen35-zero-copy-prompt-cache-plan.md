@@ -2,7 +2,7 @@
 
 ## Objective
 
-Reuse the existing MLXLLM GatedDelta Metal path from the Qwen3.5 VLM and verify a cached ~5,500-token prefix reaches first token within 5 seconds while memory demand stays below 28 GB.
+Default exact Qwen3.5 text requests to the text model, retain explicit vision support, and verify a cached ~5,500-token prefix reaches first token within 5 seconds while memory demand stays below 28 GB.
 
 ## Task 1: Remove the failed experiment
 
@@ -21,7 +21,13 @@ In the `mlx-swift-lm` submodule:
 
 Do not add a new kernel, dependency, abstraction, or CLI flag.
 
-## Task 3: Automated verification
+## Task 3: Select the text implementation by default
+
+In `Server.swift`, detect the exact `qwen3_5` architecture and suppress automatic VLM selection unless `--vision` is present. Add a focused test for normalization, the explicit override, and the `qwen3_5_moe` exclusion.
+
+Do not change routing for other architectures.
+
+## Task 4: Automated verification
 
 Run:
 
@@ -36,7 +42,7 @@ git diff --check
 
 The repository's known unrelated platform-test failures may be reported separately, but all focused tests and the release build must pass.
 
-## Task 4: Runtime benchmark
+## Task 5: Runtime benchmark
 
 Start:
 
@@ -52,12 +58,12 @@ Pass criteria:
 - memory demand below 28 GB;
 - output matches the reference response.
 
-If the benchmark fails, stop and profile the shared kernel. Do not port Rapid-MLX's kernel under this plan.
+Measured result: 1.44-second cached TTFT with 5,490 reused tokens and 15.5 GB memory demand.
 
-## Task 5: Commit
+## Task 6: Commit
 
 Commit the `mlx-swift-lm` fix using that repository's existing subject style, then commit the parent submodule pointer, diagnostics, tests, and revised docs with:
 
 ```text
-fix: reduce Qwen3.5 VLM cached TTFT
+fix: default Qwen3.5 to text-only serving
 ```
