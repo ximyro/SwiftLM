@@ -665,6 +665,9 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Pin the first eligible system-prompt KV prefix for normal text generation (not vision/audio, kv_bits, MTP, draft, or DFlash)")
     var pinSystemPrompt: Bool = false
 
+    @Option(name: .long, help: "Number of rolling non-trimmable prompt-cache entries (default: 1; 0 disables)")
+    var hybridCacheEntries: Int = 1
+
     @Option(name: .long, help: "Chunk size for prefill evaluation (default: 512, lower to prevent GPU timeout on large models)")
     var prefillSize: Int = 512
 
@@ -690,6 +693,9 @@ struct MLXServer: AsyncParsableCommand {
     var mtpAssistantModel: String?
 
     func validate() throws {
+        guard hybridCacheEntries >= 0 else {
+            throw ValidationError("--hybrid-cache-entries must be zero or greater")
+        }
         if let thinkingBudget, thinkingBudget < 0 {
             throw ValidationError("--thinking-budget must be 0 or more.")
         }
@@ -1462,6 +1468,7 @@ struct MLXServer: AsyncParsableCommand {
             prefillSize: self.prefillSize,
             turboKV: self.turboKV,
             pinSystemPrompt: self.pinSystemPrompt,
+            hybridCacheEntries: self.hybridCacheEntries,
             mtp: self.mtp,
             numMtpTokens: self.numMtpTokens,
             mtpAssistantModel: self.mtpAssistantModel
@@ -1497,7 +1504,7 @@ struct MLXServer: AsyncParsableCommand {
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
         let pinSystemPromptStr = config.pinSystemPrompt ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
-        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), pin_system_prompt=\(pinSystemPromptStr), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
+        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), pin_system_prompt=\(pinSystemPromptStr), hybrid_cache_entries=\(config.hybridCacheEntries), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
         if config.turboKV, let ctx = config.ctxSize {
             print("[SwiftLM] ⚠️  --turbo-kv has no effect with --ctx-size \(ctx): a bounded context gives the attention layers a RotatingKVCache, and TurboKV only compresses KVCacheSimple. Drop --ctx-size to use --turbo-kv.")
         }
@@ -1570,7 +1577,7 @@ struct MLXServer: AsyncParsableCommand {
         }
 
         // Chat completions — handler extracted to avoid type-checker timeout
-        let promptCache = PromptCache(maxEntries: config.promptCacheEntries)
+        let promptCache = PromptCache(maxEntries: config.promptCacheEntries, hybridEntryCapacity: config.hybridCacheEntries)
         // Cached KV is the largest evictable allocation; give it back before the OS has to
         // compress or kill. A warning drops every entry but the most recent one (the live
         // conversation), so with the default --prompt-cache-entries 1 it drops nothing; a
@@ -1787,6 +1794,7 @@ struct ServerConfig: Sendable {
     /// When true, each KVCacheSimple layer compresses history > 8192 tokens to 3-bit PolarQuant.
     let turboKV: Bool
     let pinSystemPrompt: Bool
+    let hybridCacheEntries: Int
     let mtp: Bool
     let numMtpTokens: Int
     let mtpAssistantModel: String?
@@ -1919,6 +1927,7 @@ actor PromptCache {
         let states: [[MLXArray]]     // Per-layer KV state arrays
         let metaStates: [[String]]   // Per-layer metadata
         let offsets: [Int]
+        let isNonTrimmable: Bool
         /// Hybrid entries only: earlier recurrent states, ascending by position, each
         /// strictly before `tokens.count` (the entry's own state covers that one).
         var checkpoints: [RecurrentCheckpoint] = []
@@ -1930,12 +1939,17 @@ actor PromptCache {
     /// Most recently used first. Holds at most `maxEntries`.
     private var entries: [CachedState] = []
     private let maxEntries: Int
+    private let hybridEntryCapacity: Int?
     private var pinned: CachedState?
     private var pinClaim: UUID?
     private var hits: Int = 0
     private var misses: Int = 0
 
-    init(maxEntries: Int = 1) { self.maxEntries = max(1, maxEntries) }
+    init(maxEntries: Int = 1, hybridEntryCapacity: Int? = nil) {
+        precondition((hybridEntryCapacity ?? 0) >= 0)
+        self.maxEntries = max(1, maxEntries)
+        self.hybridEntryCapacity = hybridEntryCapacity
+    }
 
     /// How many trailing tokens of a saved prompt a newer prompt may drop or rewrite and
     /// still replace it (see `isSuperseded`).
@@ -2035,6 +2049,9 @@ actor PromptCache {
         }
         // Nothing can restore an empty prompt, and it would only take a slot.
         guard !tokens.isEmpty else { return }
+        let capacity = cache.contains { !($0 is KVCacheSimple) }
+            ? hybridEntryCapacity ?? maxEntries : maxEntries
+        guard capacity > 0 else { return }
         let P = tokens.count
         let snapshot = snapshot(tokens: tokens, cache: cache)
         let metaStates = snapshot.metaStates
@@ -2052,9 +2069,9 @@ actor PromptCache {
             Self.isSuperseded($0.tokens, by: tokens, exactPrefixOnly: exactPrefixOnly)
         }
         entries.insert(
-            CachedState(tokens: tokens, states: snapshot.states, metaStates: metaStates, offsets: snapshot.offsets, checkpoints: merged),
+            CachedState(tokens: tokens, states: snapshot.states, metaStates: metaStates, offsets: snapshot.offsets, isNonTrimmable: snapshot.isNonTrimmable, checkpoints: merged),
             at: 0)
-        if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
+        if entries.count > capacity { entries.removeLast(entries.count - capacity) }
     }
 
     /// Atomically reserve the write-once pinned slot before probe/prefill work begins.
@@ -2107,7 +2124,7 @@ actor PromptCache {
         if !allArrays.isEmpty {
             eval(allArrays)
         }
-        return CachedState(tokens: tokens, states: states, metaStates: metaStates, offsets: cache.map { $0.offset })
+        return CachedState(tokens: tokens, states: states, metaStates: metaStates, offsets: cache.map { $0.offset }, isNonTrimmable: cache.contains { !($0 is KVCacheSimple) })
     }
 
     /// Checkpoints of the entry a restore resumed from, up to `resumedFrom`, plus that
@@ -2195,10 +2212,24 @@ actor PromptCache {
         let excess = cached.tokens.count - matchLen
         for i in cache.indices {
             var layer = cache[i]
-            layer.state = cached.states[i].map(detachedArray)
+            let state = cached.states[i].map(detachedArray)
+            if let list = layer as? CacheList {
+                do {
+                    let restored = try CacheList.restore(state: state, metaState: cached.metaStates[i]) as! CacheList
+                    var children: [KVCache] = []
+                    restored.mapChildren { child in children.append(child); return child }
+                    var iterator = children.makeIterator()
+                    list.mapChildren { _ in iterator.next()! }
+                } catch {
+                    misses += 1
+                    return nil
+                }
+            } else {
+                layer.state = state
+            }
             if layer is ArraysCache {
                 (layer as? BaseKVCache)?.offset = cached.offsets[i]
-            } else {
+            } else if !(layer is CacheList) {
                 layer.metaState = cached.metaStates[i]
             }
         }
@@ -2320,6 +2351,7 @@ actor PromptCache {
     }
 
     func stats() -> (hits: Int, misses: Int) { (hits, misses) }
+    func hybridEntryCount() -> Int { entries.filter { $0.isNonTrimmable }.count }
 }
 
 /// Where a hybrid (recurrent + attention) model's prompt cache may snapshot: the index
