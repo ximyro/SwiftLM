@@ -1075,8 +1075,10 @@ struct MLXServer: AsyncParsableCommand {
         // with a Trace/BPT trap on the first real generation request, caught by CI's
         // speculative-decoding suite. --vision remains a valid explicit override.
         let speculativeDecodingRequested = self.draftModel != nil || self.dflash || self.mtp
+        let qwen35TextDefault = qwen35TextOnlyByDefault(
+            modelType: architecture.modelType, explicitVision: self.vision)
         let autoDetectedVision = !self.audio && architecture.supportsVision
-            && !speculativeDecodingRequested && !self.noVision
+            && !speculativeDecodingRequested && !self.noVision && !qwen35TextDefault
         var isVision = self.vision || autoDetectedVision
         if architecture.supportsVision, !self.vision, !self.audio, speculativeDecodingRequested {
             print(
@@ -1089,6 +1091,10 @@ struct MLXServer: AsyncParsableCommand {
         } else if autoDetectedVision {
             print(
                 "[SwiftLM] Auto-detected VLM config (\(architecture.modelType ?? "unknown")); enabling vision mode."
+            )
+        } else if qwen35TextDefault, architecture.supportsVision {
+            print(
+                "[SwiftLM] Qwen3.5 text-only mode selected; pass --vision to load the VLM stack."
             )
         }
         let container: ModelContainer
@@ -1798,6 +1804,11 @@ struct ServerConfig: Sendable {
     let mtp: Bool
     let numMtpTokens: Int
     let mtpAssistantModel: String?
+}
+
+func qwen35TextOnlyByDefault(modelType: String?, explicitVision: Bool) -> Bool {
+    let normalized = modelType?.lowercased().replacingOccurrences(of: ".", with: "_")
+    return !explicitVision && normalized == "qwen3_5"
 }
 
 // ── SSD Memory Budget ────────────────────────────────────────────────────────
