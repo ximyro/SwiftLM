@@ -27,6 +27,7 @@ The fast path applies only when all of these conditions hold:
 - the server has one inference slot (`--parallel 1`);
 - prompt caching is otherwise eligible;
 - every cache layer is `MambaCache`, `RotatingKVCache`, or `KVCacheSimple`;
+- every `RotatingKVCache` layer is below `maxSize` at the snapshot boundary;
 - the cached state and metadata pass the existing restore checks.
 
 All other requests keep the current defensive-copy behavior.
@@ -51,7 +52,7 @@ Qwen3.5 satisfies this invariant for the allowed cache types:
 - `KVCacheSimple` snapshots expose arrays trimmed to the logical offset. The first append cannot fit in that exact-length state, so `update` allocates an expanded backing array before writing.
 - `RotatingKVCache` snapshots also expose arrays trimmed to the logical offset. A multi-token append concatenates into new arrays. A one-token append first expands an exact-length buffer while it remains below `maxSize`, then writes into the expanded buffer.
 
-The strict-prefix rule for non-trimmable state remains in place, so the live cache always receives at least one new token before decoding. If a future cache implementation does not satisfy these mechanics, the layer-type gate rejects it and uses defensive copying.
+The strict-prefix rule for non-trimmable state remains in place, so the live cache always receives at least one new token before decoding. A rotating cache at `maxSize` is ineligible because a one-token suffix can write directly into its ring. If a future cache implementation does not satisfy these mechanics, the eligibility gate rejects it and uses defensive copying.
 
 ## Design
 
@@ -59,7 +60,7 @@ The strict-prefix rule for non-trimmable state remains in place, so the live cac
 
 Resolve architecture eligibility when the model is loaded and carry it in `ServerConfig`. Qwen3.5 eligibility is disabled when more than one inference slot is configured.
 
-Before each zero-copy save or restore, validate the actual cache array. Every layer must be one of the allowed cache types. Validation happens before any live cache object is modified. A failed check selects the existing defensive path.
+Before each zero-copy save or restore, validate the actual cache array. Every layer must be one of the allowed cache types, and rotating layers must still have room to expand. Validation happens before any live cache object is modified. A failed check selects the existing defensive path.
 
 ### Snapshot policy
 
@@ -109,9 +110,10 @@ Add focused prompt-cache tests for:
 3. Qwen3.5 zero-copy `RotatingKVCache` restoration followed by one-token extension, then a second restore that returns unchanged keys, values, offset, and rotation metadata.
 4. The same rotating-cache isolation check with a multi-token extension.
 5. `KVCacheSimple` isolation after extension from an exact-length snapshot.
-6. Rejection of an unexpected cache type before live state is modified.
-7. Repeated pinned and hybrid zero-copy restores producing identical state.
-8. Eligibility disabled when parallelism is greater than one.
+6. Defensive fallback for a `RotatingKVCache` whose offset has reached `maxSize`.
+7. Rejection of an unexpected cache type before live state is modified.
+8. Repeated pinned and hybrid zero-copy restores producing identical state.
+9. Eligibility disabled when parallelism is greater than one.
 
 Run the existing prompt-cache test suite and a release build after the focused tests pass.
 
