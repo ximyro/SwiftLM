@@ -541,6 +541,7 @@ curl http://localhost:5413/v1/chat/completions \
 | `--stream-experts` | `false` | Enable SSD expert streaming for MoE models (10x speedup) |
 | `--turbo-kv` | `false` | Enable TurboQuant 3-bit KV cache compression (activates after 2048 tokens, server-wide) |
 | `--pin-system-prompt` | `false` | Keep the first eligible system-prompt KV prefix cached for the server lifetime. Normal text generation only; excludes vision/audio, `kv_bits`, MTP, draft, and DFlash paths. |
+| `--hybrid-cache-entries` | `1` | Rolling prompt prefixes retained for hybrid/sliding-window caches. `0` disables; higher values trade memory for reuse. The pinned system prompt is separate. |
 | `--draft-model` | (none) | Draft model path/ID for speculative decoding. When used with `--stream-experts`, `--num-draft-tokens` is auto-capped to 1 to minimise SSD I/O fan-out (see performance note above). |
 | `--num-draft-tokens` | `4` | Tokens per speculation round. Auto-capped to 1 when combined with `--stream-experts`. |
 | `--dflash` | `false` | Enable DFlash block-diffusion speculative decoding. Requires a compatible DFlash draft model |

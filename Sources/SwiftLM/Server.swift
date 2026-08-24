@@ -309,6 +309,9 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Pin the first eligible system-prompt KV prefix for normal text generation (not vision/audio, kv_bits, MTP, draft, or DFlash)")
     var pinSystemPrompt: Bool = false
 
+    @Option(name: .long, help: "Number of rolling non-trimmable prompt-cache entries (default: 1; 0 disables)")
+    var hybridCacheEntries: Int = 1
+
     @Option(name: .long, help: "Chunk size for prefill evaluation (default: 512, lower to prevent GPU timeout on large models)")
     var prefillSize: Int = 512
 
@@ -332,6 +335,12 @@ struct MLXServer: AsyncParsableCommand {
 
     @Option(name: .long, help: "Assistant checkpoint providing MTP heads, for model families that ship them separately instead of in the main checkpoint (Gemma 4). Ignored when the main model carries its own MTP heads (Qwen3.5, DeepSeek V4).")
     var mtpAssistantModel: String?
+
+    func validate() throws {
+        guard hybridCacheEntries >= 0 else {
+            throw ValidationError("--hybrid-cache-entries must be zero or greater")
+        }
+    }
 
     mutating func run() async throws {
         // Raise the open-file limit: large sharded models (e.g. Kimi K2.5, 182 safetensor
@@ -953,6 +962,7 @@ struct MLXServer: AsyncParsableCommand {
             prefillSize: self.prefillSize,
             turboKV: self.turboKV,
             pinSystemPrompt: self.pinSystemPrompt,
+            hybridCacheEntries: self.hybridCacheEntries,
             mtp: self.mtp,
             numMtpTokens: self.numMtpTokens,
             mtpAssistantModel: self.mtpAssistantModel
@@ -988,7 +998,7 @@ struct MLXServer: AsyncParsableCommand {
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
         let pinSystemPromptStr = config.pinSystemPrompt ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
-        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), pin_system_prompt=\(pinSystemPromptStr), mtp=\(mtpStr)")
+        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), pin_system_prompt=\(pinSystemPromptStr), hybrid_cache_entries=\(config.hybridCacheEntries), mtp=\(mtpStr)")
 
         // ── Build Hummingbird router ──
         let router = Router()
@@ -1058,7 +1068,7 @@ struct MLXServer: AsyncParsableCommand {
         }
 
         // Chat completions — handler extracted to avoid type-checker timeout
-        let promptCache = PromptCache()
+        let promptCache = PromptCache(hybridEntryCapacity: config.hybridCacheEntries)
         router.post("/v1/chat/completions") { request, _ -> Response in
             do {
                 let bodyData = try await collectBody(request)
@@ -1237,6 +1247,7 @@ struct ServerConfig: Sendable {
     /// When true, each KVCacheSimple layer compresses history > 8192 tokens to 3-bit PolarQuant.
     let turboKV: Bool
     let pinSystemPrompt: Bool
+    let hybridCacheEntries: Int
     let mtp: Bool
     let numMtpTokens: Int
     let mtpAssistantModel: String?
@@ -1364,11 +1375,18 @@ actor PromptCache {
         let offsets: [Int]           // Per-layer KVCache.offset at snapshot time
     }
 
+    private let hybridEntryCapacity: Int
     private var cached: CachedState?
+    private var hybridCached: [CachedState] = []
     private var pinned: CachedState?
     private var pinClaim: UUID?
     private var hits: Int = 0
     private var misses: Int = 0
+
+    init(hybridEntryCapacity: Int = 1) {
+        precondition(hybridEntryCapacity >= 0)
+        self.hybridEntryCapacity = hybridEntryCapacity
+    }
 
     /// Save the full prompt token sequence and its KV state.
     /// IMPORTANT: We must eval() the state arrays immediately. The state getter may
@@ -1382,7 +1400,21 @@ actor PromptCache {
     /// may keep calling it after the first token because KVCacheSimple is sliced back
     /// to P below.
     func save(tokens: [Int], cache: [KVCache]) {
-        cached = snapshot(tokens: tokens, cache: cache)
+        guard cache.contains(where: { !($0 is KVCacheSimple) }) else {
+            cached = snapshot(tokens: tokens, cache: cache)
+            return
+        }
+        guard hybridEntryCapacity > 0 else { return }
+
+        let state = snapshot(tokens: tokens, cache: cache)
+        if let existing = hybridCached.firstIndex(where: { $0.tokens == tokens }) {
+            hybridCached.remove(at: existing)
+        }
+        hybridCached.append(state)
+        while hybridCached.count > hybridEntryCapacity {
+            let evicted = hybridCached.removeFirst()
+            print("[SwiftLM] Prompt cache evicted hybrid snapshot: \(evicted.tokens.count) tokens")
+        }
     }
 
     /// Atomically reserve the write-once pinned slot before probe/prefill work begins.
@@ -1408,6 +1440,12 @@ actor PromptCache {
 
     func hasPinnedSnapshot() -> Bool { pinned != nil }
 
+    private func detached(_ array: MLXArray) -> MLXArray {
+        // A full-range subscript is still a view. The identity operation creates an
+        // independent buffer when evaluated, which retained cache snapshots require.
+        array + MLXArray(0, dtype: array.dtype)
+    }
+
     private func snapshot(tokens: [Int], cache: [KVCache]) -> CachedState {
         let P = tokens.count
         // For attention KVCacheSimple layers, the state tensor is [B, H, T, D] with a
@@ -1428,7 +1466,7 @@ actor PromptCache {
             // Everything else (MambaCache slots, RotatingKVCache rings, …): deep-copy —
             // the state getters may return references to live buffers that in-place
             // updates mutate after the snapshot.
-            return s.map { $0[.ellipsis] }
+            return s.map(detached)
         }
         let metaStates = cache.map { $0.metaState }
         let offsets = cache.map { $0.offset }
@@ -1454,11 +1492,21 @@ actor PromptCache {
         // see startStream in handleChatCompletion) is a strict prefix of the new
         // prompt: restore the state as-is and prefill only the suffix.
         let hasNonTrimmableLayer = cache.contains { !($0 is KVCacheSimple) }
-        var best: (state: CachedState, matchLength: Int, excess: Int, source: String)?
-        var candidates: [(CachedState?, String)] = [(cached, "rolling")]
-        if allowPinned { candidates.append((pinned, "pinned")) }
-        for (candidate, source) in candidates {
-            guard let candidate, !candidate.tokens.isEmpty else { continue }
+        var best: (
+            state: CachedState, matchLength: Int, excess: Int, source: String,
+            hybridIndex: Int?
+        )?
+        var candidates: [(CachedState, String, Int?)]
+        if hasNonTrimmableLayer {
+            candidates = hybridCached.enumerated().reversed().map {
+                ($0.element, "hybrid", $0.offset)
+            }
+        } else {
+            candidates = cached.map { [($0, "rolling", nil)] } ?? []
+        }
+        if allowPinned, let pinned { candidates.append((pinned, "pinned", nil)) }
+        for (candidate, source, hybridIndex) in candidates {
+            guard !candidate.tokens.isEmpty else { continue }
             let matchLength = zip(candidate.tokens, newTokens).prefix { $0 == $1 }.count
             guard matchLength > 0 else { continue }
 
@@ -1476,7 +1524,7 @@ actor PromptCache {
             }
 
             if best == nil || matchLength > best!.matchLength {
-                best = (candidate, matchLength, excess, source)
+                best = (candidate, matchLength, excess, source, hybridIndex)
             }
         }
 
@@ -1485,11 +1533,16 @@ actor PromptCache {
             return nil
         }
 
-        // Pinned state must remain immutable across every restore. Rotating caches
-        // update their live buffers in place, so give them fresh arrays to mutate.
+        if let hybridIndex = best.hybridIndex {
+            let state = hybridCached.remove(at: hybridIndex)
+            hybridCached.append(state)
+        }
+
+        // Retained non-trimmable and pinned state must remain immutable across restores.
+        // Rotating caches update their live buffers in place, so give them fresh arrays.
         let restoredStates: [[MLXArray]]
-        if best.source == "pinned" {
-            restoredStates = best.state.states.map { $0.map { $0[.ellipsis] } }
+        if best.hybridIndex != nil || best.source == "pinned" {
+            restoredStates = best.state.states.map { $0.map(detached) }
             let arrays = restoredStates.flatMap { $0 }
             if !arrays.isEmpty { eval(arrays) }
         } else {
@@ -1499,12 +1552,22 @@ actor PromptCache {
         // Safe to restore: trim won't corrupt any layer
         for i in 0..<min(cache.count, restoredStates.count) {
             var layer = cache[i]
-            layer.state = restoredStates[i]
+            if let list = layer as? CacheList {
+                do {
+                    try list.restore(
+                        state: restoredStates[i], metaState: best.state.metaStates[i])
+                } catch {
+                    misses += 1
+                    return nil
+                }
+            } else {
+                layer.state = restoredStates[i]
+            }
             if layer is ArraysCache {
                 // Slot-based caches restore positionally via the state setter;
                 // ArraysCache's metaState setter asserts, so restore offset directly.
                 (layer as? BaseKVCache)?.offset = best.state.offsets[i]
-            } else {
+            } else if !(layer is CacheList) {
                 layer.metaState = best.state.metaStates[i]
             }
         }
@@ -1517,6 +1580,7 @@ actor PromptCache {
     }
 
     func stats() -> (hits: Int, misses: Int) { (hits, misses) }
+    func hybridEntryCount() -> Int { hybridCached.count }
 }
 
 func systemPromptCacheBoundary(

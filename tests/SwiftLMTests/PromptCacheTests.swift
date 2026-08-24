@@ -18,11 +18,18 @@ final class PromptCacheTests: XCTestCase {
 
     /// Create a KVCacheSimple with a pre-populated state of shape [1, 2, T, 4].
     /// This mimics a layer that has processed T tokens.
-    private func makePopulatedSimpleCache(seqLen T: Int) -> KVCacheSimple {
+    private func makePopulatedSimpleCache(seqLen T: Int, value: Float = 1) -> KVCacheSimple {
         let cache = KVCacheSimple()
-        let keys = MLXArray.ones([1, 2, T, 4], dtype: .float16)
-        let values = MLXArray.ones([1, 2, T, 4], dtype: .float16)
+        let scalar = MLXArray(value, dtype: .float16)
+        let keys = MLXArray.ones([1, 2, T, 4], dtype: .float16) * scalar
+        let values = MLXArray.ones([1, 2, T, 4], dtype: .float16) * scalar
         _ = cache.update(keys: keys, values: values)
+        return cache
+    }
+
+    private func makePopulatedArraysCache(value: Float = 7) -> ArraysCache {
+        let cache = ArraysCache(size: 1)
+        cache[0] = MLXArray([value])
         return cache
     }
 
@@ -103,7 +110,132 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertEqual(stats.misses, 0)
     }
 
-    // MARK: - Group 2: restore() guards
+    // MARK: - Group 2: hybrid LRU
+
+    func testHybridCapacityZeroSkipsSave() async {
+        let pc = PromptCache(hybridEntryCapacity: 0)
+        await pc.save(tokens: [1, 2], cache: [MambaCache()])
+
+        let result = await pc.restore(
+            newTokens: [1, 2, 3], into: [MambaCache()] as [any KVCache])
+        let entryCount = await pc.hybridEntryCount()
+        XCTAssertNil(result)
+        XCTAssertEqual(entryCount, 0)
+    }
+
+    func testHybridDefaultRetainsOneEntry() async {
+        let pc = PromptCache()
+        await pc.save(tokens: [1, 2], cache: [MambaCache()])
+        await pc.save(tokens: [3, 4], cache: [MambaCache()])
+
+        let entryCount = await pc.hybridEntryCount()
+        let evicted = await pc.restore(
+            newTokens: [1, 2, 9], into: [MambaCache()] as [any KVCache])
+        let retained = await pc.restore(
+            newTokens: [3, 4, 9], into: [MambaCache()] as [any KVCache])
+        XCTAssertEqual(entryCount, 1)
+        XCTAssertNil(evicted)
+        XCTAssertEqual(retained, 2)
+    }
+
+    func testHybridRestoreUsesLongestPrefix() async {
+        let pc = PromptCache(hybridEntryCapacity: 2)
+        await pc.save(tokens: [1, 2], cache: [MambaCache()])
+        await pc.save(tokens: [1, 2, 3, 4], cache: [MambaCache()])
+
+        let result = await pc.restore(
+            newTokens: [1, 2, 3, 4, 5], into: [MambaCache()] as [any KVCache])
+        XCTAssertEqual(result, 4)
+    }
+
+    func testHybridHitRefreshesLRUOrder() async {
+        let pc = PromptCache(hybridEntryCapacity: 2)
+        await pc.save(tokens: [1, 2], cache: [MambaCache()])
+        await pc.save(tokens: [3, 4], cache: [MambaCache()])
+
+        let refreshed = await pc.restore(
+            newTokens: [1, 2, 9], into: [MambaCache()] as [any KVCache])
+        XCTAssertEqual(refreshed, 2)
+        await pc.save(tokens: [5, 6], cache: [MambaCache()])
+
+        let evicted = await pc.restore(
+            newTokens: [3, 4, 9], into: [MambaCache()] as [any KVCache])
+        let retained = await pc.restore(
+            newTokens: [1, 2, 9], into: [MambaCache()] as [any KVCache])
+        XCTAssertNil(evicted)
+        XCTAssertEqual(retained, 2)
+    }
+
+    func testHybridSaveReplacesIdenticalTokens() async {
+        let pc = PromptCache(hybridEntryCapacity: 2)
+        await pc.save(tokens: [1, 2], cache: [makePopulatedArraysCache(value: 1)])
+        await pc.save(tokens: [3, 4], cache: [makePopulatedArraysCache(value: 3)])
+        await pc.save(tokens: [1, 2], cache: [makePopulatedArraysCache(value: 2)])
+        await pc.save(tokens: [5, 6], cache: [makePopulatedArraysCache(value: 5)])
+
+        let entryCount = await pc.hybridEntryCount()
+        let replaced = ArraysCache(size: 1)
+        let replacedResult = await pc.restore(
+            newTokens: [1, 2, 9], into: [replaced] as [any KVCache])
+        let evicted = await pc.restore(
+            newTokens: [3, 4, 9], into: [ArraysCache(size: 1)] as [any KVCache])
+        XCTAssertEqual(entryCount, 2)
+        XCTAssertEqual(replacedResult, 2)
+        XCTAssertEqual(replaced.state[0].item(Float.self), 2)
+        XCTAssertNil(evicted)
+    }
+
+    func testHybridRestoreDoesNotMutateRetainedSnapshot() async {
+        let pc = PromptCache(hybridEntryCapacity: 1)
+        await pc.save(tokens: [1, 2], cache: [makePopulatedArraysCache()])
+
+        let first = ArraysCache(size: 1)
+        let firstResult = await pc.restore(
+            newTokens: [1, 2, 3], into: [first] as [any KVCache])
+        XCTAssertEqual(firstResult, 2)
+        first.state[0][0] = MLXArray(Float(99))
+        eval(first.state)
+
+        let second = ArraysCache(size: 1)
+        let secondResult = await pc.restore(
+            newTokens: [1, 2, 4], into: [second] as [any KVCache])
+        XCTAssertEqual(secondResult, 2)
+        XCTAssertEqual(second.state[0].item(Float.self), 7)
+    }
+
+    func testHybridRestoreReconstructsCacheListChildren() async {
+        let pc = PromptCache(hybridEntryCapacity: 1)
+        let mamba = MambaCache()
+        mamba[0] = MLXArray([Float(11)])
+        let attention = makePopulatedSimpleCache(seqLen: 2)
+        await pc.save(
+            tokens: [1, 2], cache: [CacheList(mamba, attention)])
+
+        let restored = CacheList(MambaCache(), KVCacheSimple())
+        let result = await pc.restore(
+            newTokens: [1, 2, 3], into: [restored] as [any KVCache])
+
+        XCTAssertEqual(result, 2)
+        XCTAssertEqual(restored[0].state[0].item(Float.self), 11)
+        XCTAssertEqual(restored[1].state[0].dim(2), 2)
+    }
+
+    func testDenseCacheKeepsSingleRollingEntry() async {
+        let pc = PromptCache(hybridEntryCapacity: 2)
+        await pc.save(tokens: [1, 2], cache: [makePopulatedSimpleCache(seqLen: 2)])
+        await pc.save(tokens: [3, 4], cache: [makePopulatedSimpleCache(seqLen: 2)])
+
+        let entryCount = await pc.hybridEntryCount()
+        let evicted = await pc.restore(
+            newTokens: [1, 2], into: [KVCacheSimple()] as [any KVCache])
+        let retained = await pc.restore(
+            newTokens: [3, 4], into: [KVCacheSimple()] as [any KVCache])
+        XCTAssertEqual(entryCount, 0)
+        XCTAssertNil(evicted)
+        XCTAssertEqual(retained, 2)
+    }
+
+    // MARK: - Group 3: restore() guards
 
     /// A full recurrent-cache match is unusable because generation must replay one token.
     func testRestore_MambaCacheRequiresStrictExtension() async {
@@ -201,7 +333,7 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertEqual(stats.misses, 1, "Zero-match bail must increment miss counter")
     }
 
-    // MARK: - Group 3: Pinned system prompt
+    // MARK: - Group 4: Pinned system prompt
 
     func testPinnedSnapshotIsWriteOnceAndSurvivesRollingSave() async {
         let pc = PromptCache()
@@ -226,6 +358,23 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertEqual(result, 3)
     }
 
+    func testPinnedSnapshotIsOutsideHybridCapacity() async {
+        let pc = PromptCache(hybridEntryCapacity: 1)
+        guard let claim = await pc.claimPinnedSnapshot() else {
+            return XCTFail("Expected to claim pinned slot")
+        }
+        _ = await pc.savePinned(
+            claim: claim, tokens: [1, 2], cache: [MambaCache()])
+        await pc.save(tokens: [3, 4], cache: [MambaCache()])
+        await pc.save(tokens: [5, 6], cache: [MambaCache()])
+
+        let entryCount = await pc.hybridEntryCount()
+        let result = await pc.restore(
+            newTokens: [1, 2, 9], into: [MambaCache()] as [any KVCache])
+        XCTAssertEqual(entryCount, 1)
+        XCTAssertEqual(result, 2)
+    }
+
     func testRestorePrefersLongerRollingMatchOverPinnedMatch() async {
         let pc = PromptCache()
         guard let claim = await pc.claimPinnedSnapshot() else {
@@ -240,6 +389,24 @@ final class PromptCacheTests: XCTestCase {
         let restored: [any KVCache] = [KVCacheSimple()]
         let result = await pc.restore(newTokens: [1, 2, 3, 99], into: restored)
         XCTAssertEqual(result, 3)
+    }
+
+    func testRestorePrefersRollingOverPinnedOnEqualMatch() async {
+        let pc = PromptCache()
+        guard let claim = await pc.claimPinnedSnapshot() else {
+            return XCTFail("Expected to claim pinned slot")
+        }
+        _ = await pc.savePinned(
+            claim: claim, tokens: [1, 2],
+            cache: [makePopulatedSimpleCache(seqLen: 2, value: 9)])
+        await pc.save(
+            tokens: [1, 2], cache: [makePopulatedSimpleCache(seqLen: 2, value: 3)])
+
+        let restored = KVCacheSimple()
+        let result = await pc.restore(
+            newTokens: [1, 2], into: [restored] as [any KVCache])
+        XCTAssertEqual(result, 2)
+        XCTAssertEqual(restored.state[0][0, 0, 0, 0].item(Float.self), 3)
     }
 
     func testPinnedSnapshotCanBeExcludedFromRestore() async {
@@ -314,7 +481,29 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertTrue(command.pinSystemPrompt)
     }
 
-    // MARK: - Group 4: Decision branch ordering (pure logic tests)
+    func testHybridCacheEntriesDefaultsToOne() throws {
+        let command = try MLXServer.parse(["--model", "test-model"])
+        XCTAssertEqual(command.hybridCacheEntries, 1)
+    }
+
+    func testHybridCacheEntriesAcceptsZeroAndPositiveValues() throws {
+        let disabled = try MLXServer.parse([
+            "--model", "test-model", "--hybrid-cache-entries", "0",
+        ])
+        let enabled = try MLXServer.parse([
+            "--model", "test-model", "--hybrid-cache-entries", "3",
+        ])
+        XCTAssertEqual(disabled.hybridCacheEntries, 0)
+        XCTAssertEqual(enabled.hybridCacheEntries, 3)
+    }
+
+    func testHybridCacheEntriesRejectsNegativeValues() {
+        XCTAssertThrowsError(try MLXServer.parse([
+            "--model", "test-model", "--hybrid-cache-entries=-1",
+        ]))
+    }
+
+    // MARK: - Group 5: Decision branch ordering (pure logic tests)
 
     /// PR #85 fix 6: skipPromptCache must be true when multimodal.
     func testSkipPromptCache_Multimodal() {
@@ -382,7 +571,7 @@ final class PromptCacheTests: XCTestCase {
             "Without draft model, cache hit should be the chosen path")
     }
 
-    // MARK: - Group 5: Stats tracking
+    // MARK: - Group 6: Stats tracking
 
     /// Hit/miss counters must accumulate correctly.
     func testStats_AccumulateCorrectly() async {
