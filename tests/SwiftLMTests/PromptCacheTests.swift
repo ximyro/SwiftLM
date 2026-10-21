@@ -69,7 +69,7 @@ final class PromptCacheTests: XCTestCase {
         let cache = makePopulatedSimpleCache(seqLen: 10)
 
         let tokens = Array(0..<10)
-        await pc.save(tokens: tokens, cache: [cache], allowRecurrent: true)
+        await pc.save(tokens: tokens, cache: [cache])
 
         // Restore with exact same tokens -> full match
         let freshCache = [KVCacheSimple()] as [any KVCache]
@@ -89,7 +89,7 @@ final class PromptCacheTests: XCTestCase {
         let cache = makePopulatedSimpleCache(seqLen: 5)
         let tokens = Array(0..<5)
 
-        await pc.save(tokens: tokens, cache: [cache], allowRecurrent: true)
+        await pc.save(tokens: tokens, cache: [cache])
 
         let freshCache = [KVCacheSimple()] as [any KVCache]
         let result = await pc.restore(newTokens: tokens, into: freshCache)
@@ -103,7 +103,7 @@ final class PromptCacheTests: XCTestCase {
         let tokens = [10, 20, 30]
 
         // Should not crash
-        await pc.save(tokens: tokens, cache: [cache], allowRecurrent: true)
+        await pc.save(tokens: tokens, cache: [cache])
 
         let stats = await pc.stats()
         XCTAssertEqual(stats.hits, 0)
@@ -222,8 +222,8 @@ final class PromptCacheTests: XCTestCase {
 
     func testDenseCacheKeepsSingleRollingEntry() async {
         let pc = PromptCache(hybridEntryCapacity: 2)
-        await pc.save(tokens: [1, 2], cache: [makePopulatedSimpleCache(seqLen: 2)], allowRecurrent: true)
-        await pc.save(tokens: [3, 4], cache: [makePopulatedSimpleCache(seqLen: 2)], allowRecurrent: true)
+        await pc.save(tokens: [1, 2], cache: [makePopulatedSimpleCache(seqLen: 2)])
+        await pc.save(tokens: [3, 4], cache: [makePopulatedSimpleCache(seqLen: 2)])
 
         let entryCount = await pc.hybridEntryCount()
         let evicted = await pc.restore(
@@ -266,7 +266,7 @@ final class PromptCacheTests: XCTestCase {
         let pc = PromptCache()
         let cache = makePopulatedSimpleCache(seqLen: 5)
         let tokens = [10, 20, 30, 40, 50]
-        await pc.save(tokens: tokens, cache: [cache], allowRecurrent: true)
+        await pc.save(tokens: tokens, cache: [cache])
 
         let freshCache: [any KVCache] = [KVCacheSimple()]
         let result = await pc.restore(newTokens: tokens, into: freshCache)
@@ -280,7 +280,7 @@ final class PromptCacheTests: XCTestCase {
     func testRestore_PrefixMatch() async {
         let pc = PromptCache()
         let cache = makePopulatedSimpleCache(seqLen: 5)
-        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [cache], allowRecurrent: true)
+        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [cache])
 
         let freshCache: [any KVCache] = [KVCacheSimple()]
         let result = await pc.restore(newTokens: [1, 2, 3, 99, 100], into: freshCache)
@@ -291,7 +291,7 @@ final class PromptCacheTests: XCTestCase {
     func testRestore_NoMatch() async {
         let pc = PromptCache()
         let cache = makePopulatedSimpleCache(seqLen: 5)
-        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [cache], allowRecurrent: true)
+        await pc.save(tokens: [1, 2, 3, 4, 5], cache: [cache])
 
         let freshCache: [any KVCache] = [KVCacheSimple()]
         let result = await pc.restore(newTokens: [99, 98, 97], into: freshCache)
@@ -373,6 +373,9 @@ final class PromptCacheTests: XCTestCase {
             newTokens: [1, 2, 9], into: [MambaCache()] as [any KVCache])
         XCTAssertEqual(entryCount, 1)
         XCTAssertEqual(result, 2)
+        let exact = await pc.restoreExactPrefix(
+            newTokens: [1, 2, 9], limit: 2, into: [MambaCache()] as [any KVCache])
+        XCTAssertEqual(exact, 2)
     }
 
     func testRestorePrefersLongerRollingMatchOverPinnedMatch() async {
@@ -481,9 +484,9 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertTrue(command.pinSystemPrompt)
     }
 
-    func testHybridCacheEntriesDefaultsToOne() throws {
+    func testHybridCacheEntriesDefaultsToPromptCacheEntries() throws {
         let command = try MLXServer.parse(["--model", "test-model"])
-        XCTAssertEqual(command.hybridCacheEntries, 1)
+        XCTAssertNil(command.hybridCacheEntries)
     }
 
     func testHybridCacheEntriesAcceptsZeroAndPositiveValues() throws {
@@ -578,7 +581,7 @@ final class PromptCacheTests: XCTestCase {
     func testStats_AccumulateCorrectly() async {
         let pc = PromptCache()
         let cache = makePopulatedSimpleCache(seqLen: 3)
-        await pc.save(tokens: [1, 2, 3], cache: [cache], allowRecurrent: true)
+        await pc.save(tokens: [1, 2, 3], cache: [cache])
 
         // Miss (no overlap)
         let fresh1: [any KVCache] = [KVCacheSimple()]

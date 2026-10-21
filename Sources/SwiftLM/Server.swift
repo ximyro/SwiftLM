@@ -665,8 +665,8 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Pin the first eligible system-prompt KV prefix for normal text generation (not vision/audio, kv_bits, MTP, draft, or DFlash)")
     var pinSystemPrompt: Bool = false
 
-    @Option(name: .long, help: "Number of rolling non-trimmable prompt-cache entries (default: 1; 0 disables)")
-    var hybridCacheEntries: Int = 1
+    @Option(name: .long, help: "Override the non-trimmable prompt-cache entry limit (default: --prompt-cache-entries; 0 disables)")
+    var hybridCacheEntries: Int?
 
     @Option(name: .long, help: "Chunk size for prefill evaluation (default: 512, lower to prevent GPU timeout on large models)")
     var prefillSize: Int = 512
@@ -693,7 +693,7 @@ struct MLXServer: AsyncParsableCommand {
     var mtpAssistantModel: String?
 
     func validate() throws {
-        guard hybridCacheEntries >= 0 else {
+        if let hybridCacheEntries, hybridCacheEntries < 0 {
             throw ValidationError("--hybrid-cache-entries must be zero or greater")
         }
         if let thinkingBudget, thinkingBudget < 0 {
@@ -1510,7 +1510,7 @@ struct MLXServer: AsyncParsableCommand {
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
         let pinSystemPromptStr = config.pinSystemPrompt ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
-        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), pin_system_prompt=\(pinSystemPromptStr), hybrid_cache_entries=\(config.hybridCacheEntries), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
+        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), pin_system_prompt=\(pinSystemPromptStr), hybrid_cache_entries=\(config.hybridCacheEntries ?? config.promptCacheEntries), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
         if config.turboKV, let ctx = config.ctxSize {
             print("[SwiftLM] ⚠️  --turbo-kv has no effect with --ctx-size \(ctx): a bounded context gives the attention layers a RotatingKVCache, and TurboKV only compresses KVCacheSimple. Drop --ctx-size to use --turbo-kv.")
         }
@@ -1800,7 +1800,7 @@ struct ServerConfig: Sendable {
     /// When true, each KVCacheSimple layer compresses history > 8192 tokens to 3-bit PolarQuant.
     let turboKV: Bool
     let pinSystemPrompt: Bool
-    let hybridCacheEntries: Int
+    let hybridCacheEntries: Int?
     let mtp: Bool
     let numMtpTokens: Int
     let mtpAssistantModel: String?
@@ -2055,7 +2055,9 @@ actor PromptCache {
         tokens: [Int], cache: [KVCache], allowRecurrent: Bool = false,
         checkpoints: [RecurrentCheckpoint] = [], resumedFrom: Int = 0
     ) {
-        if !allowRecurrent, cache.contains(where: { $0 is MambaCache }) {
+        if !allowRecurrent, cache.contains(where: {
+            !($0 is KVCacheSimple) && !($0 is RotatingKVCache)
+        }) {
             return
         }
         // Nothing can restore an empty prompt, and it would only take a slot.
@@ -2839,6 +2841,7 @@ func handleChatCompletion(
     let requestedSystemPinClaim = systemPinClaim
 
     // ── Cache-aware generation (standard path) ──
+    do {
     let (stream, onPrefillDone) = try await container.perform { context -> (AsyncStream<Generation>, (() async -> Void)?) in
         let cache = try context.model.newCache(parameters: params)
 
@@ -2889,16 +2892,11 @@ func handleChatCompletion(
         let promptLength = promptTokens.count
         if let claim = requestedSystemPinClaim {
             if !skipPromptCache, let boundary = requestedSystemPinBoundary {
-                do {
-                    _ = try TokenIterator(
-                        input: LMInput(text: sliceText(lmInput.text, from: 0, to: boundary)),
-                        model: context.model, cache: cache, parameters: params)
-                    _ = await promptCache.savePinned(
-                        claim: claim, tokens: Array(promptTokens[..<boundary]), cache: cache)
-                } catch {
-                    await promptCache.releasePinnedClaim(claim)
-                    throw error
-                }
+                _ = try TokenIterator(
+                    input: LMInput(text: sliceText(lmInput.text, from: 0, to: boundary)),
+                    model: context.model, cache: cache, parameters: params)
+                _ = await promptCache.savePinned(
+                    claim: claim, tokens: Array(promptTokens[..<boundary]), cache: cache)
             } else {
                 await promptCache.releasePinnedClaim(claim)
             }
@@ -3076,7 +3074,12 @@ func handleChatCompletion(
         }
         return (stream, onPrefillDone)
     }
+        if let claim = requestedSystemPinClaim { await promptCache.releasePinnedClaim(claim) }
         return (stream, onPrefillDone)
+    } catch {
+        if let claim = requestedSystemPinClaim { await promptCache.releasePinnedClaim(claim) }
+        throw error
+    }
     }  // end startGeneration
 
     if isStream {
@@ -3110,6 +3113,7 @@ func handleChatCompletion(
 struct ThinkingStateTracker {
     enum HarmonyChannel { case analysis, final, commentary }
     enum Phase {
+        case preThinking
         case thinking
         case responding
         case harmonyPreamble(HarmonyChannel)
@@ -3126,8 +3130,8 @@ struct ThinkingStateTracker {
     /// - Parameter startInThinking: true when the chat template already emitted an
     ///   unclosed opening tag at the end of the prompt, so the model's first token
     ///   is reasoning rather than response text (issue #108).
-    init(startInThinking: Bool = false) {
-        self.phase = startInThinking ? .thinking : .responding
+    init(startInThinking: Bool? = nil) {
+        self.phase = startInThinking.map { $0 ? .thinking : .responding } ?? .preThinking
     }
 
     /// Whether a rendered prompt ends inside an unclosed thinking block.
@@ -3168,6 +3172,36 @@ struct ThinkingStateTracker {
 
         while !buffer.isEmpty {
             switch phase {
+            case .preThinking:
+                if let (range, channel) = firstHarmonyChannel(in: buffer) {
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .harmonyPreamble(channel)
+                    continue
+                }
+                let startRange = Self.firstRange(in: buffer, of: Self.openTags)
+                let endRange = Self.firstRange(in: buffer, of: Self.closeTags)
+                if let endRange,
+                   startRange == nil || endRange.lowerBound < startRange!.lowerBound
+                {
+                    reasoning += String(buffer[buffer.startIndex..<endRange.lowerBound])
+                    buffer.removeSubrange(buffer.startIndex..<endRange.upperBound)
+                    phase = .responding
+                } else if let range = startRange {
+                    content += String(buffer[buffer.startIndex..<range.lowerBound])
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    phase = .thinking
+                } else if isSuffixOfTag(
+                    buffer,
+                    tags: Self.openTags + Self.closeTags + [
+                        "<|channel|>analysis", "<|channel|>final", "<|channel|>commentary",
+                        "<|channel|>", "<|start|>assistant",
+                    ]
+                ) {
+                    return (reasoning, content)
+                } else {
+                    reasoning += buffer
+                    buffer = ""
+                }
             case .responding:
                 if let (range, channel) = firstHarmonyChannel(in: buffer) {
                     content += stripHarmonyStructuralTokens(String(buffer[buffer.startIndex..<range.lowerBound]))
@@ -3246,7 +3280,7 @@ struct ThinkingStateTracker {
         defer { buffer = "" }
         guard !buffer.isEmpty else { return ("", "") }
         switch phase {
-        case .thinking, .harmonyMessage(.analysis):
+        case .preThinking, .thinking, .harmonyMessage(.analysis):
             return (buffer, "")
         case .responding, .harmonyMessage(.final):
             return ("", buffer)
@@ -3396,7 +3430,7 @@ func handleChatStreaming(
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
-    tools: [ChatCompletionRequest.ToolDef]?,
+    tools: [ChatCompletionRequest.ToolDef]? = nil,
     emitPrefillProgress: Bool
 ) -> Response {
     let (sseStream, cont) = AsyncStream<String>.makeStream()
@@ -3546,6 +3580,19 @@ func handleChatStreaming(
                 if tokenEcho {
                     print(text, terminator: "")
                     fflush(stdout)
+                }
+
+                if !enableThinking, shouldStopGemma4ThoughtScaffolding(fullText) {
+                    cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: "stop"))
+                    let genDur = Date().timeIntervalSince(genStart)
+                    let genTokPerSec = genDur > 0 ? Double(completionTokenCount) / genDur : 0
+                    if includeUsage {
+                        cont.yield(sseUsageChunk(modelId: modelId, promptTokens: promptTokenCount, completionTokens: completionTokenCount, tokPerSec: genTokPerSec, durationMs: genDur * 1000))
+                    }
+                    cont.yield("data: [DONE]\r\n\r\n")
+                    cont.finish()
+                    stopped = true
+                    continue
                 }
 
                 // ── JSON mode buffering: accumulate early tokens, strip prefix, then flush ──
@@ -3777,7 +3824,7 @@ func handleChatNonStreaming(
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
-    tools: [ChatCompletionRequest.ToolDef]?,
+    tools: [ChatCompletionRequest.ToolDef]? = nil,
     onPrefillDone: (() async -> Void)? = nil
 ) async throws -> Response {
     var fullText = ""
@@ -3792,6 +3839,10 @@ func handleChatNonStreaming(
         case .chunk(let text, _):
             fullText += text
             completionTokenCount += 1
+            if !enableThinking, shouldStopGemma4ThoughtScaffolding(fullText) {
+                generationStopReason = .stop
+                break generationLoop
+            }
             // End generation at the first stop sequence, as the streaming path does. The
             // text is trimmed below either way; continuing only spends compute and bills
             // the client for tokens that are discarded. `.info` never arrives on this
@@ -3871,6 +3922,9 @@ func handleChatNonStreaming(
         // tag when the reasoning was empty (`</think>` first, e.g. a zero thinking budget).
         reasoningContent = extracted
         responseContent = remaining
+    } else if isGemma4ThoughtScaffoldingOnly(fullText) {
+        responseContent = ""
+        finishReason = "stop"
     }
 
     // ── JSON mode validation ──
@@ -3961,9 +4015,10 @@ func extractThinkingBlock(from text: String, alreadyOpen: Bool = false) -> (Stri
 
     guard let startRange = startTag else {
         if let endRange = endTag {
-            let thinking = String(text[..<endRange.lowerBound])
             let remaining = String(text[endRange.upperBound...])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard remaining.hasPrefix("<tool_call>") else { return (nil, text) }
+            let thinking = String(text[..<endRange.lowerBound])
             return (thinking.isEmpty ? nil : thinking, remaining)
         }
         return (nil, text)
@@ -4589,6 +4644,24 @@ func samplingSeed(_ requested: Int?) -> UInt64? {
 /// into a single grapheme.
 func stopScanWindow(_ stopSequences: [String]) -> Int {
     (stopSequences.map(\.count).max() ?? 0) + 1
+}
+
+func isGemma4ThoughtScaffoldingOnly(_ text: String) -> Bool {
+    let markerCount = text.components(separatedBy: "<|channel>thought").count - 1
+    guard markerCount > 0 else { return false }
+
+    let stripped = text
+        .replacingOccurrences(of: "<|channel>thought\n", with: "")
+        .replacingOccurrences(of: "<|channel>thought", with: "")
+        .replacingOccurrences(of: "<channel|>", with: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    return stripped.isEmpty
+}
+
+func shouldStopGemma4ThoughtScaffolding(_ text: String) -> Bool {
+    let markerCount = text.components(separatedBy: "<|channel>thought").count - 1
+    return markerCount >= 2 && isGemma4ThoughtScaffoldingOnly(text)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
