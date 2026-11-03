@@ -2693,7 +2693,7 @@ func handleChatCompletion(
 
     // The Jinja template evaluates `not enable_thinking | default(false)`. If we pass nil instead of
     // true, it evaluates to false and still breaks. We MUST explicitly pass the boolean.
-    let templateContext: [String: any Sendable] = ["enable_thinking": enableThinking]
+    let templateContext = chatReq.templateContext(enableThinking: enableThinking)
     let userInput = UserInput(chat: chatMessages, tools: toolSpecs, additionalContext: templateContext)
     print("[Server Debug] Created UserInput with \(userInput.images.count) images and \(userInput.audios.count) audio inputs.")
     let lmInput = try await container.prepare(input: userInput)
@@ -5407,12 +5407,22 @@ struct ChatCompletionRequest: Decodable {
     let chatTemplateKwargs: [String: Bool]?
     /// Per-request reasoning-token cap; overrides `--thinking-budget`.
     let thinkingBudget: Int?
+    /// Model-specific effort passed to the chat template without changing the token budget.
+    let reasoningEffort: String?
     /// Top-level thinking override emitted by Aegis-AI gateway
     let enableThinking: Bool?
     /// Number of bits for native MLX quantized KV cache (nil = no quantization).
     /// Only 4 and 8 are supported by the underlying MLX QuantizedKVCache.
     /// Enables `QuantizedKVCache` instead of `KVCacheSimple`.  Separate from `--turbo-kv`.
     let kvBits: Int?
+
+    func templateContext(enableThinking: Bool) -> [String: any Sendable] {
+        var context: [String: any Sendable] = ["enable_thinking": enableThinking]
+        if let reasoningEffort {
+            context["reasoning_effort"] = reasoningEffort
+        }
+        return context
+    }
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature, tools, stop, seed
@@ -5429,6 +5439,7 @@ struct ChatCompletionRequest: Decodable {
         case chatTemplateKwargs = "chat_template_kwargs"
         case enableThinking = "enable_thinking"
         case thinkingBudget = "thinking_budget"
+        case reasoningEffort = "reasoning_effort"
         case kvBits = "kv_bits"
     }
 }
