@@ -2749,6 +2749,11 @@ func handleChatCompletion(
     let prefillStart = Date()
 
     let modelId = config.modelId
+    let generationConfiguration = await container.configuration
+    let usesStructuredReasoning = (dflashModel == nil || dflashTargetModel == nil)
+        && (generationConfiguration.reasoningConfig != nil
+            || generationConfiguration.toolCallFormat == .gptOSS
+            || generationConfiguration.toolCallFormat == .atem)
 
     // ── Generation start (deferred for streaming) ──
     // For streaming responses this closure runs inside the SSE consumer task
@@ -2962,9 +2967,10 @@ func handleChatCompletion(
                     tokens: Array(promptTokens[..<boundary]), cache: cache, allowRecurrent: true,
                     checkpoints: checkpoints, resumedFrom: start)
             }
-            stream = try MLXLMCommon.generate(
+            stream = try generateFromFullPrompt(
                 input: LMInput(text: sliceText(lmInput.text, from: boundary)),
-                cache: cache, parameters: params, context: context, components: genComponents)
+                cache: cache, parameters: params, context: context,
+                promptTokens: promptTokens, components: genComponents)
         } else if let boundary = rotatingBoundary {
             var start = await promptCache.restore(newTokens: promptTokens, into: cache) ?? 0
             if start >= promptLength {
@@ -2986,9 +2992,10 @@ func handleChatCompletion(
                 start = promptLength - 1
                 for layer in cache { layer.trim(1) }
             }
-            stream = try MLXLMCommon.generate(
+            stream = try generateFromFullPrompt(
                 input: LMInput(text: sliceText(lmInput.text, from: start)),
-                cache: cache, parameters: params, context: context, components: genComponents)
+                cache: cache, parameters: params, context: context,
+                promptTokens: promptTokens, components: genComponents)
         } else if let draftRef = draftModelRef {
             // Speculative decoding path: draft model generates candidates, main model verifies.
             // Bypass prompt cache to avoid draft/main KV drift on partial-match restores.
@@ -3014,13 +3021,14 @@ func handleChatCompletion(
             }
             let trimmedInput = LMInput(text: sliceText(lmInput.text, from: startIndex))
             if config.mtp, let mtpCtx = mtpContext(main: context, assistant: mtpAssistant) {
-                stream = try MLXLMCommon.generateMTP(
-                    input: trimmedInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
+                stream = try generateFromFullPrompt(
+                    input: trimmedInput, cache: cache, parameters: params, context: mtpCtx,
+                    promptTokens: promptTokens, numMTPTokens: config.numMtpTokens
                 )
             } else {
-                stream = try MLXLMCommon.generate(
+                stream = try generateFromFullPrompt(
                     input: trimmedInput, cache: cache, parameters: params, context: context,
-                    components: genComponents
+                    promptTokens: promptTokens, components: genComponents
                 )
             }
         } else {
@@ -3087,7 +3095,8 @@ func handleChatCompletion(
             startGeneration: startGeneration, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
             enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
-            jsonMode: jsonMode, tokenEcho: config.tokenEcho, slot: slot,
+            structuredReasoning: usesStructuredReasoning, jsonMode: jsonMode,
+            tokenEcho: config.tokenEcho, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
             tools: chatReq.tools,
             emitPrefillProgress: emitPrefillProgress
@@ -3097,7 +3106,8 @@ func handleChatCompletion(
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, tokenEcho: config.tokenEcho,
+            thinkingPreOpened: thinkingPreOpened, structuredReasoning: usesStructuredReasoning,
+            jsonMode: jsonMode, tokenEcho: config.tokenEcho,
             slot: slot, stats: stats, genStart: genStart, prefillStart: prefillStart,
             tools: chatReq.tools, onPrefillDone: onPrefillDone
         )
@@ -3424,6 +3434,7 @@ func handleChatStreaming(
     promptTokenCount: Int,
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
+    structuredReasoning: Bool = false,
     jsonMode: Bool = false,
     tokenEcho: Bool = true,
     slot: GenerationSlot,
@@ -3482,7 +3493,9 @@ func handleChatStreaming(
         var fullText = ""
         var stopped = false
         var firstToken = true
-        var tracker = ThinkingStateTracker(startInThinking: enableThinking && thinkingPreOpened)
+        var nativeReasoning = structuredReasoning
+        var tracker = ThinkingStateTracker(
+            startInThinking: enableThinking && thinkingPreOpened && !nativeReasoning)
         // Raw characters handed to the thinking tracker — not necessarily characters on
         // the wire, since the tracker may still be holding a partial tag — plus the tail
         // withheld because it could still open a stop sequence. Counting consumption
@@ -3525,6 +3538,7 @@ func handleChatStreaming(
         // ── JSON mode streaming: buffer early tokens to strip hallucinated prefixes ──
         var jsonBuffering = jsonMode
         var jsonBuffer = ""
+        var jsonBufferedChunks = 0
         // Hands the buffered text to the client, once: at the flush threshold, or at the
         // end of a stream that never reached it. The thresholds count chunks, and a reply
         // that starts with `{` is held by the generator as a possible bare tool call until
@@ -3535,7 +3549,7 @@ func handleChatStreaming(
             jsonBuffering = false
             let cleaned = jsonModeFlushText(jsonBuffer)
             jsonBuffer = ""
-            let (rText, cText) = enableThinking ? tracker.process(cleaned) : ("", cleaned)
+            let (rText, cText) = enableThinking && !nativeReasoning ? tracker.process(cleaned) : ("", cleaned)
             if !rText.isEmpty || !cText.isEmpty {
                 cont.yield(sseChunk(
                     modelId: modelId,
@@ -3553,11 +3567,8 @@ func handleChatStreaming(
 
         for await generation in stream {
             if stopped { break }
-            switch generation {
-            case .chunk(let text, _):
+            if let text = generation.chunk ?? generation.reasoning {
                 completionTokenCount += 1
-                fullText += text
-                unscannedStopChars += text.count
                 // GPU yield: prevent Metal from starving macOS WindowServer
                 if completionTokenCount % 8 == 0 {
                     try? await Task.sleep(for: .microseconds(50))
@@ -3581,7 +3592,11 @@ func handleChatStreaming(
                     print(text, terminator: "")
                     fflush(stdout)
                 }
-
+            }
+            switch generation {
+            case .chunk(let text, _):
+                fullText += text
+                unscannedStopChars += text.count
                 if !enableThinking, shouldStopGemma4ThoughtScaffolding(fullText) {
                     cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: "stop"))
                     let genDur = Date().timeIntervalSince(genStart)
@@ -3598,9 +3613,10 @@ func handleChatStreaming(
                 // ── JSON mode buffering: accumulate early tokens, strip prefix, then flush ──
                 if jsonBuffering {
                     jsonBuffer += text
+                    jsonBufferedChunks += 1
                     let trimmed = jsonBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let enoughTokens = completionTokenCount >= 3
-                    let hitMax = completionTokenCount >= 32
+                    let enoughTokens = jsonBufferedChunks >= 3
+                    let hitMax = jsonBufferedChunks >= 32
                     let hasDoubleBrace = enoughTokens && trimmed.hasPrefix("{") && trimmed.dropFirst().contains("{")
                     if hitMax || hasDoubleBrace {
                         flushJSONBuffer()
@@ -3638,7 +3654,7 @@ func handleChatStreaming(
                 emittedTextCount += survivingText.count
 
                 // ── Route text through thinking state machine ──
-                let (reasoningText, contentText) = enableThinking
+                let (reasoningText, contentText) = enableThinking && !nativeReasoning
                     ? tracker.process(survivingText)
                     : ("", survivingText)
 
@@ -3650,7 +3666,7 @@ func handleChatStreaming(
                                             finishReason: nil))
                     }
                     // Drain anything still held for a partial tag that never completed.
-                    if enableThinking {
+                    if enableThinking && !nativeReasoning {
                         let (r, c) = tracker.flush()
                         if !r.isEmpty || !c.isEmpty {
                             cont.yield(sseChunk(modelId: modelId, reasoningContent: r.isEmpty ? nil : r,
@@ -3681,6 +3697,13 @@ func handleChatStreaming(
                         ))
                     }
                     // If tracker buffer is holding a partial tag, nothing to emit yet — that's fine.
+                }
+
+            case .reasoning(let text):
+                nativeReasoning = true
+                if enableThinking, !text.isEmpty {
+                    cont.yield(sseChunk(
+                        modelId: modelId, reasoningContent: text, content: nil, finishReason: nil))
                 }
 
             case .toolCall(let tc):
@@ -3724,7 +3747,7 @@ func handleChatStreaming(
                     // The withheld tail never became a stop sequence, so it is ordinary
                     // output and must not be dropped.
                     if !heldStopTail.isEmpty {
-                        let (r, c) = enableThinking
+                        let (r, c) = enableThinking && !nativeReasoning
                             ? tracker.process(heldStopTail) : ("", heldStopTail)
                         heldStopTail = ""
                         if !r.isEmpty || !c.isEmpty {
@@ -3734,7 +3757,7 @@ func handleChatStreaming(
                     }
                     // Drain text the tracker was holding on a partial tag that never
                     // completed, otherwise the tail of the response is dropped (#108).
-                    if enableThinking {
+                    if enableThinking && !nativeReasoning {
                         let (r, c) = tracker.flush()
                         if !r.isEmpty || !c.isEmpty {
                             cont.yield(sseChunk(modelId: modelId,
@@ -3787,7 +3810,7 @@ func handleChatStreaming(
             flushJSONBuffer()
         }
         if !stopped && !heldStopTail.isEmpty {
-            let (r, c) = enableThinking ? tracker.process(heldStopTail) : ("", heldStopTail)
+            let (r, c) = enableThinking && !nativeReasoning ? tracker.process(heldStopTail) : ("", heldStopTail)
             heldStopTail = ""
             if !r.isEmpty || !c.isEmpty {
                 cont.yield(sseChunk(modelId: modelId, reasoningContent: r.isEmpty ? nil : r,
@@ -3818,6 +3841,7 @@ func handleChatNonStreaming(
     promptTokenCount: Int,
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
+    structuredReasoning: Bool = false,
     jsonMode: Bool = false,
     tokenEcho: Bool = true,
     slot: GenerationSlot,
@@ -3828,6 +3852,8 @@ func handleChatNonStreaming(
     onPrefillDone: (() async -> Void)? = nil
 ) async throws -> Response {
     var fullText = ""
+    var reasoningText = ""
+    var nativeReasoning = structuredReasoning
     var completionTokenCount = 0
     var collectedToolCalls: [ToolCallResponse] = []
     var tcIndex = 0
@@ -3835,23 +3861,8 @@ func handleChatNonStreaming(
     var firstToken = true
     let stopWindow = stopScanWindow(stopSequences)
     generationLoop: for await generation in stream {
-        switch generation {
-        case .chunk(let text, _):
-            fullText += text
+        if let text = generation.chunk ?? generation.reasoning {
             completionTokenCount += 1
-            if !enableThinking, shouldStopGemma4ThoughtScaffolding(fullText) {
-                generationStopReason = .stop
-                break generationLoop
-            }
-            // End generation at the first stop sequence, as the streaming path does. The
-            // text is trimmed below either way; continuing only spends compute and bills
-            // the client for tokens that are discarded. `.info` never arrives on this
-            // exit, so the count stays the chunk count.
-            if !stopSequences.isEmpty,
-               checkStopSequences(fullText, stopSequences: stopSequences, lookback: stopWindow + text.count) != nil
-            {
-                break generationLoop
-            }
             // GPU yield: prevent Metal from starving macOS WindowServer
             if completionTokenCount % 8 == 0 {
                 try? await Task.sleep(for: .microseconds(50))
@@ -3870,6 +3881,26 @@ func handleChatNonStreaming(
                 print(text, terminator: "")
                 fflush(stdout)
             }
+        }
+        switch generation {
+        case .chunk(let text, _):
+            fullText += text
+            if !enableThinking, shouldStopGemma4ThoughtScaffolding(fullText) {
+                generationStopReason = .stop
+                break generationLoop
+            }
+            // End generation at the first stop sequence, as the streaming path does. The
+            // text is trimmed below either way; continuing only spends compute and bills
+            // the client for tokens that are discarded. `.info` never arrives on this
+            // exit, so the count stays the chunk count.
+            if !stopSequences.isEmpty,
+               checkStopSequences(fullText, stopSequences: stopSequences, lookback: stopWindow + text.count) != nil
+            {
+                break generationLoop
+            }
+        case .reasoning(let text):
+            nativeReasoning = true
+            reasoningText += text
         case .toolCall(let tc):
             let preparedArgs = prepareToolCallArgumentsForEmission(
                 name: tc.function.name, arguments: tc.function.arguments, tools: tools)
@@ -3914,7 +3945,9 @@ func handleChatNonStreaming(
     // ── Thinking: extract <think>…</think> into reasoning_content ──
     var reasoningContent: String? = nil
     var responseContent = fullText
-    if enableThinking {
+    if enableThinking && nativeReasoning {
+        reasoningContent = reasoningText.isEmpty ? nil : reasoningText
+    } else if enableThinking {
         print("srv debug: pre-extract fullText=\(fullText.prefix(40).debugDescription)")
         let (extracted, remaining) = extractThinkingBlock(from: fullText, alreadyOpen: thinkingPreOpened)
         print("srv debug: extracted=\(extracted != nil ? "true" : "false"), remaining_len=\(remaining.count)")
@@ -4247,8 +4280,7 @@ func handleTextStreaming(
         }
         for await generation in stream {
             if stopped { break }
-            switch generation {
-            case .chunk(let text, _):
+            if generation.chunk != nil || generation.reasoning != nil {
                 if firstToken {
                     heartbeatTask?.cancel()
                     heartbeatTask = nil
@@ -4257,6 +4289,9 @@ func handleTextStreaming(
                     firstToken = false
                 }
                 completionTokenCount += 1
+            }
+            switch generation {
+            case .chunk(let text, _):
                 fullText += text
                 // GPU yield: prevent Metal from starving macOS WindowServer
                 if completionTokenCount % 8 == 0 {
@@ -4290,8 +4325,7 @@ func handleTextStreaming(
                         cont.yield(sseTextChunk(modelId: modelId, text: releasable, finishReason: nil))
                     }
                 }
-            case .toolCall, .rejectedToolCall:
-                // Text-completion endpoint: tool calling has no wire representation here.
+            case .reasoning, .toolCall, .rejectedToolCall:
                 break
             case .info(let info):
                 // The chunk count undercounts: tokens the decoder buffers (tool-call
@@ -4367,6 +4401,8 @@ func handleTextNonStreaming(
             if completionTokenCount % 8 == 0 {
                 try? await Task.sleep(for: .microseconds(50))
             }
+        case .reasoning:
+            completionTokenCount += 1
         case .info(let info):
             generationStopReason = info.stopReason
             completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
