@@ -28,6 +28,20 @@ final class ReasoningEffortTests: XCTestCase {
         XCTAssertEqual(request.templateContext(enableThinking: false)["enable_thinking"] as? Bool, false)
     }
 
+    func testTopLevelEffortPreservesOtherTemplateKwargs() throws {
+        let request = try decode(#"{"messages":[],"reasoning_effort":"medium","chat_template_kwargs":{"reasoning_effort":"high","model_identity":"custom","thinking":true,"enable_thinking":true}}"#)
+        let context = request.templateContext(enableThinking: false)
+        XCTAssertEqual(context["reasoning_effort"] as? String, "medium")
+        XCTAssertEqual(context["model_identity"] as? String, "custom")
+        XCTAssertEqual(context["thinking"] as? Bool, true)
+        XCTAssertEqual(context["enable_thinking"] as? Bool, false)
+    }
+
+    func testKwargEffortSurvivesWhenTopLevelEffortIsAbsent() throws {
+        let request = try decode(#"{"messages":[],"chat_template_kwargs":{"reasoning_effort":"high"}}"#)
+        XCTAssertEqual(request.templateContext(enableThinking: true)["reasoning_effort"] as? String, "high")
+    }
+
     func testNonStringEffortIsAClientError() throws {
         do {
             _ = try decode(#"{"messages":[],"reasoning_effort":42}"#)

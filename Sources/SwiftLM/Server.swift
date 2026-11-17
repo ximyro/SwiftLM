@@ -2915,13 +2915,6 @@ func handleChatCompletion(
     // ── Cache-aware generation (standard path) ──
     do {
     let (stream, onPrefillDone) = try await container.perform { context -> (AsyncStream<Generation>, (() async -> Void)?) in
-        // mlx-swift-lm can route a model's thinking into separate `.reasoning` events, with the
-        // delimiters removed. This server splits `<think>…</think>` out of `.chunk` text itself
-        // (`ThinkingStateTracker`) and maps it to `reasoning_content`, so the generation loop is
-        // given a context without a reasoning protocol and keeps emitting the text inline. The
-        // thinking budget above still reads the real config from the container.
-        var context = context
-        context.configuration.reasoningConfig = nil
         let cache = try context.model.newCache(parameters: params)
 
         // ── TurboQuant: enable 3-bit KV compression on every KVCacheSimple layer ──
@@ -3134,9 +3127,10 @@ func handleChatCompletion(
                 )
             } else {
                 let start = try await snapshotPrompt(from: 0)
-                stream = try MLXLMCommon.generate(
+                stream = try generateFromFullPrompt(
                     input: start == 0 ? lmInput : LMInput(text: sliceText(lmInput.text, from: start)),
-                    cache: cache, parameters: params, context: context, components: genComponents
+                    cache: cache, parameters: params, context: context,
+                    promptTokens: promptTokens, components: genComponents
                 )
             }
         }
